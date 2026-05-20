@@ -1,0 +1,274 @@
+.tracking-page {
+  padding: 20px;
+  background-color: #f5f5f5;
+  min-height: 100vh;
+}
+
+.tracking-page h1 {
+  text-align: center;
+  color: #333;
+  margin-bottom: 30px;
+  font-size: 32px;
+}
+
+.tracking-container {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: 20px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.map-section {
+  background: white;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+  min-height: 600px;
+  position: relative;
+}
+
+.tracking-map {
+  width: 100%;
+  height: 100%;
+  min-height: 600px;
+  z-index: 1;
+}
+
+.tracking-map-loading {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(16, 24, 40, 0.78);
+  color: #fff;
+  padding: 8px 14px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  z-index: 600;
+  pointer-events: none;
+}
+
+.vehicles-list {
+  background: white;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+}
+
+.vehicles-list h2 {
+  color: #333;
+  margin-bottom: 20px;
+  font-size: 20px;
+}
+
+.tracking-search {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.tracking-search label {
+  font-size: 13px;
+  font-weight: 700;
+  color: #2b2b2b;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.tracking-search input {
+  border: 1px solid #d7dce3;
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.tracking-search input:focus {
+  border-color: #0f62fe;
+  box-shadow: 0 0 0 3px rgba(15, 98, 254, 0.12);
+}
+
+.tracking-search button {
+  border: none;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #0f62fe, #4c9aff);
+  color: white;
+  padding: 12px 16px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+}
+
+.tracking-search button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px rgba(15, 98, 254, 0.2);
+}
+
+.tracking-search button:disabled {
+  opacity: 0.7;
+  cursor: not-allowed;
+}
+
+.tracking-status {
+  background: #f7f9fc;
+  border: 1px solid #e6ebf2;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+}
+
+.tracking-status p {
+  margin: 0;
+  font-size: 13px;
+  color: #445068;
+  line-height: 1.5;
+}
+
+.tracking-error {
+  margin-top: 8px !important;
+  color: #b42318 !important;
+}
+
+.vehicles-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+  overflow-y: auto;
+  max-height: 560px;
+}
+
+.vehicle-card {
+  border: 2px solid #e0e0e0;
+  border-radius: 6px;
+  padding: 15px;
+  cursor: pointer;
+  transition: all 0.3s ease;
+  background-color: #fff;
+}
+
+.vehicle-card:hover {
+  border-color: #007bff;
+  box-shadow: 0 4px 12px rgba(0, 123, 255, 0.15);
+  transform: translateY(-2px);
+}
+
+.vehicle-card.active {
+  border-color: #007bff;
+  background-color: #e7f3ff;
+}
+
+.vehicle-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.vehicle-header h3 {
+  color: #333;
+  margin: 0;
+  font-size: 16px;
+}
+
+.status-badge {
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: bold;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.status-badge.in-transit {
+  background-color: #e3f2fd;
+  color: #1976d2;
+}
+
+.status-badge.idle {
+  background-color: #f5f5f5;
+  color: #666;
+}
+
+.vehicle-details {
+  font-size: 13px;
+  color: #666;
+  line-height: 1.6;
+}
+
+.vehicle-details p {
+  margin: 6px 0;
+}
+
+.vehicle-details strong {
+  color: #333;
+}
+
+.vehicle-popup {
+  font-family: Arial, sans-serif;
+  min-width: 200px;
+}
+
+.vehicle-popup h3 {
+  margin: 0 0 10px 0;
+  color: #333;
+  font-size: 16px;
+}
+
+.vehicle-popup p {
+  margin: 5px 0;
+  font-size: 13px;
+  color: #666;
+}
+
+.vehicle-popup strong {
+  color: #333;
+}
+
+/* Responsive design */
+@media (max-width: 1024px) {
+  .tracking-container {
+    grid-template-columns: 1fr;
+  }
+
+  .map-section {
+    min-height: 400px;
+  }
+
+  .tracking-map {
+    min-height: 400px;
+  }
+}
+
+@media (max-width: 768px) {
+  .tracking-page {
+    padding: 15px;
+  }
+
+  .tracking-page h1 {
+    font-size: 24px;
+    margin-bottom: 20px;
+  }
+
+  .vehicles-grid {
+    max-height: 300px;
+  }
+
+  .vehicle-card {
+    padding: 12px;
+  }
+
+  .vehicle-header h3 {
+    font-size: 14px;
+  }
+
+  .vehicle-details {
+    font-size: 12px;
+  }
+}
