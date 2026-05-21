@@ -25,6 +25,7 @@ DB_CONFIG = {
     "user": _get_env("DB_USER"),
     "password": _get_env("DB_PASSWORD"),
     "database": _get_env("DB_NAME"),
+    "port": int(_get_env("DB_PORT", 3306)),
 }
 
 
@@ -35,7 +36,7 @@ def validate_db_environment():
         missing_list = ", ".join(missing)
         raise RuntimeError(
             f"Missing required database environment variables: {missing_list}. "
-            "Set DB_HOST, DB_USER, DB_PASSWORD, and DB_NAME before starting the backend."
+            "Set DB_HOST, DB_USER, DB_PASSWORD, DB_NAME, and DB_PORT before starting the backend."
         )
 
     return True

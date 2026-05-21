@@ -1,39 +1,41 @@
+import { API_BASE_URL } from './apiBase'
+
 /**
- * Send a message to the backend chat API with distance and price information
+ * Send a message to the backend chat API.
  * @param {string} userInput - The user's message
- * @param {number} calculatedDistance - The calculated distance
- * @param {number} calculatedPrice - The calculated price
  * @returns {Promise<{ reply: string }>} - Normalized chatbot response
  */
-export const sendMessage = async (userInput, calculatedDistance, calculatedPrice) => {
-  // Generate or retrieve a persistent user_id for session management
-  let userId = localStorage.getItem('chat_user_id')
-  if (!userId) {
-    userId = `user_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
-    localStorage.setItem('chat_user_id', userId)
-  }
-
+export const sendMessage = async (userInput) => {
   const payload = {
     message: String(userInput ?? '').trim(),
-    distance: calculatedDistance === null || calculatedDistance === undefined ? null : Number(calculatedDistance),
-    price: calculatedPrice === null || calculatedPrice === undefined ? null : Number(calculatedPrice),
-    user_id: userId, // Include user_id for proper session management
   }
 
-  const res = await fetch('http://127.0.0.1:5000/chat', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-  })
+  console.log('[chatService] request payload', payload)
+
+  let res
+  try {
+    res = await fetch(`${API_BASE_URL}/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    })
+  } catch (error) {
+    console.error('[chatService] network error', error)
+    throw new Error(`Unable to reach chat service at ${API_BASE_URL}/chat`)
+  }
 
   let data = {}
   const contentType = res.headers.get('content-type') || ''
 
   if (contentType.includes('application/json')) {
     data = await res.json()
+  } else {
+    data = { raw: await res.text() }
   }
+
+  console.log('[chatService] response', { status: res.status, ok: res.ok, data })
 
   const reply =
     typeof data.reply === 'string'
@@ -45,7 +47,15 @@ export const sendMessage = async (userInput, calculatedDistance, calculatedPrice
           : ''
 
   if (!res.ok) {
-    throw new Error(reply || `Chat API request failed with status ${res.status}`)
+    const backendError =
+      typeof data.error === 'string'
+        ? data.error
+        : typeof data.message === 'string'
+          ? data.message
+          : typeof data.raw === 'string'
+            ? data.raw
+            : ''
+    throw new Error(reply || backendError || `Chat API request failed with status ${res.status}`)
   }
 
   return {

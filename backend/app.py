@@ -16,6 +16,7 @@ import google.generativeai as genai
 import requests
 from gps_simulator import GPSSimulator
 from db import DB_CONFIG, get_db_connection, test_db_connection, save_chat_history, save_conversation_json, validate_db_environment, initialize_schema
+from config import ProductionConfig
 from logging_utils import logger, setup_logger, log_print
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
@@ -24,6 +25,7 @@ logger = setup_logger()
 print = log_print
 
 app = Flask(__name__)
+app.config.from_object(ProductionConfig)
 app.config['ENV'] = os.getenv('FLASK_ENV', 'production')
 app.config['DEBUG'] = False
 CORS(app)
@@ -2435,7 +2437,7 @@ def track_lorry(lorry_number):
 @app.route("/chat", methods=["POST"])
 def chat():
     try:
-        data = request.get_json(silent=True) or {}
+        data = request.get_json() or {}
         user_id = data.get("user_id", "default_user")  # Accept user_id from client
         raw_message = str(data.get("message", "")).strip()
         message = raw_message.lower()

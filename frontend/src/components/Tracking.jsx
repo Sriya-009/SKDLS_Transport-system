@@ -2,9 +2,8 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { MapContainer, Marker, Popup, TileLayer, useMap } from 'react-leaflet'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+import { API_BASE_URL } from '../services/apiBase'
 import '../styles/Tracking.css'
-
-const BACKEND_BASE_URL = 'http://127.0.0.1:5000'
 
 // Fix Leaflet marker icon issue
 L.Icon.Default.mergeOptions({
@@ -151,7 +150,7 @@ export default function Tracking() {
     setError('')
 
     try {
-      const response = await fetch(`${BACKEND_BASE_URL}/track/${encodeURIComponent(trimmed)}`)
+      const response = await fetch(`${API_BASE_URL}/track/${encodeURIComponent(trimmed)}`)
       const data = await response.json()
 
       if (!response.ok) {

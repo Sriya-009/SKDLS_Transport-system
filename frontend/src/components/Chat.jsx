@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import { sendMessage } from '../services/chatService'
 import { calculateDistance, calculatePrice, extractDistance } from '../utils/transportUtils'
+import { API_BASE_URL } from '../services/apiBase'
 import './Chat.css'
 
 export default function Chat({ source = '', destination = '', distanceMessage = '' }) {
@@ -58,7 +59,7 @@ export default function Chat({ source = '', destination = '', distanceMessage = 
     let mounted = true
     const fetchWelcome = async () => {
       try {
-        const res = await fetch(`http://127.0.0.1:5000/chat/welcome?user_id=${userIdRef.current}`)
+        const res = await fetch(`${API_BASE_URL}/chat/welcome?user_id=${userIdRef.current}`)
         if (!mounted) return
         if (!res.ok) throw new Error('non-200')
         const data = await res.json()
@@ -202,7 +203,7 @@ export default function Chat({ source = '', destination = '', distanceMessage = 
           console.log('📤 Final payload to backend:', payload)
         }
 
-        const res = await fetch('http://127.0.0.1:5000/chat', {
+        const res = await fetch(`${API_BASE_URL}/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
