@@ -1,29 +1,33 @@
-import { useEffect, useRef, useState } from 'react'
-import { BrowserRouter as Router, Routes, Route, Link } from 'react-router-dom'
-import Chat from './components/Chat'
-import Tracking from './components/Tracking'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
+import { BrowserRouter as Router, Routes, Route, Link, useLocation, useNavigate } from 'react-router-dom'
+import Booking from './components/Booking'
+import BrandMark from './components/BrandMark'
+import LandingPage from './components/LandingPage'
+import { MaintenancePage, NotFoundPage } from './components/SystemPages'
+import ProtectedRoute from './components/ProtectedRoute'
+import { PageSkeleton, OfflineBanner, OnboardingModal, ToastViewport } from './components/AppChrome'
+import { useAuth } from './context/AuthContext'
+import { useUi } from './context/UiContext'
 import { extractDistance } from './utils/transportUtils'
-import truckIcon from './assets/truck-launcher.png'
 import './App.css'
+import './styles/Auth.css'
+import './styles/demo-ready.css'
+
+const Chat = lazy(() => import('./components/Chat'))
+const BookingConfirmation = lazy(() => import('./components/BookingConfirmation'))
+const AdminDashboard = lazy(() => import('./components/AdminDashboard'))
+const Tracking = lazy(() => import('./components/Tracking'))
+const AuthPage = lazy(() => import('./components/AuthPage'))
+const ProfilePage = lazy(() => import('./components/ProfilePage'))
 
 const navLinks = [
+  { name: 'Shipments', path: '/shipments' },
   { name: 'Loading', path: '/loading' },
   { name: 'Unloading', path: '/unloading' },
   { name: 'Transportation', path: '/transportation' },
   { name: 'Tracking', path: '/tracking' },
+  { name: 'Admin Dashboard', path: '/admin' },
 ]
-
-function HomePage() {
-  return (
-    <section className="hero">
-      <h1>Welcome to SKDLS Transportations</h1>
-      <p>Your Trusted Shipping Partner</p>
-      <Link to="/support" className="hero-chat-launcher" aria-label="Open chatbot">
-        <img src={truckIcon} alt="Open chatbot" className="hero-chat-image" />
-      </Link>
-    </section>
-  )
-}
 
 function LoadingPage() {
   const [transportType, setTransportType] = useState('')
@@ -251,7 +255,7 @@ function LoadingPage() {
         <div className="service-content">
           <div className="form-card">
             <div className="summary-section">
-              <h2>Booking Summary</h2>
+              <h2>Shipment Summary</h2>
               <div className="summary-content">
                 <div className="summary-row">
                   <span className="summary-label">Source:</span>
@@ -365,34 +369,201 @@ function ServicePage({ title }) {
   )
 }
 
+function AppContent() {
+  const { user, ready, logout } = useAuth()
+  const { toasts, dismissToast, isOnline, onboardingVisible, completeOnboarding } = useUi()
+  const navigate = useNavigate()
+  const location = useLocation()
+  const [menuOpen, setMenuOpen] = useState(false)
+  const menuRef = useRef(null)
+
+  useEffect(() => {
+    const handlePointerDown = (event) => {
+      if (menuRef.current && !menuRef.current.contains(event.target)) {
+        setMenuOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handlePointerDown)
+    document.addEventListener('touchstart', handlePointerDown)
+
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown)
+      document.removeEventListener('touchstart', handlePointerDown)
+    }
+  }, [])
+
+  useEffect(() => {
+    setMenuOpen(false)
+  }, [location.pathname])
+
+  const visibleLinks = navLinks.filter((link) => link.path !== '/admin' || user?.role === 'admin')
+
+  const getInitials = (name) => {
+    const parts = String(name || 'User').trim().split(/\s+/).filter(Boolean)
+    return parts.slice(0, 2).map((part) => part[0]?.toUpperCase()).join('') || 'U'
+  }
+
+  const handleLogout = async () => {
+    await logout()
+    setMenuOpen(false)
+    navigate('/', { replace: true })
+  }
+
+  return (
+    <main className="app">
+      <OfflineBanner isOnline={isOnline} />
+      <ToastViewport toasts={toasts} onDismiss={dismissToast} />
+      <OnboardingModal open={onboardingVisible} onClose={completeOnboarding} />
+      <nav className="navbar">
+        <div className="brand-shell">
+          <Link to="/" className="navbar-logo" aria-label="SKDLS Transport AI home">
+            <BrandMark tagline="Shipment booking, payment, and dispatch" />
+          </Link>
+        </div>
+
+        <div className="nav-links">
+          {visibleLinks.map((link) => (
+            <Link to={link.path} key={link.name} className="nav-link">
+              {link.name}
+            </Link>
+          ))}
+        </div>
+
+        <div className="nav-actions">
+          {ready && !user && (
+            <>
+              <Link to="/login" className="nav-button nav-button--ghost">
+                Login
+              </Link>
+              <Link to="/signup" className="nav-button nav-button--primary">
+                Sign up
+              </Link>
+            </>
+          )}
+
+          {ready && user && (
+            <div className="account-menu" ref={menuRef}>
+              <button type="button" className="account-toggle" onClick={() => setMenuOpen((previous) => !previous)}>
+                <span className="account-avatar">{getInitials(user.full_name)}</span>
+                <span className="account-meta">
+                  <strong>{user.full_name}</strong>
+                  <span>{user.role}</span>
+                </span>
+              </button>
+
+              {menuOpen && (
+                <div className="account-dropdown">
+                  <div className="account-dropdown__user">
+                    <strong>{user.full_name}</strong>
+                    <span>{user.email}</span>
+                  </div>
+
+                  <Link to="/profile" className="account-dropdown__link">
+                    Profile
+                  </Link>
+                  <Link to="/shipments" className="account-dropdown__link">
+                    Shipments
+                  </Link>
+                  {user.role === 'admin' && (
+                    <Link to="/admin" className="account-dropdown__link">
+                      Admin dashboard
+                    </Link>
+                  )}
+                  <button type="button" className="account-dropdown__button account-dropdown__button--danger" onClick={handleLogout}>
+                    Logout
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </nav>
+
+      <div key={location.pathname} className="page-transition">
+        <Suspense fallback={<PageSkeleton />}>
+          <Routes location={location}>
+            <Route path="/" element={<LandingPage />} />
+            <Route path="/login" element={<AuthPage mode="login" />} />
+            <Route path="/signup" element={<AuthPage mode="signup" />} />
+            <Route path="/loading" element={<LoadingPage />} />
+            <Route path="/unloading" element={<ServicePage title="Unloading" />} />
+            <Route path="/transportation" element={<ServicePage title="Transportation" />} />
+            <Route path="/support" element={<Chat />} />
+            <Route path="/maintenance" element={<MaintenancePage />} />
+            <Route path="/booking-confirmation/:bookingId" element={<BookingConfirmation />} />
+
+            <Route element={<ProtectedRoute />}>
+              <Route path="/shipments" element={<Booking />} />
+              <Route path="/tracking" element={<Tracking />} />
+              <Route path="/profile" element={<ProfilePage />} />
+            </Route>
+
+            <Route element={<ProtectedRoute allowedRoles={['admin']} />}>
+              <Route path="/admin" element={<AdminDashboard />} />
+            </Route>
+
+            <Route path="*" element={<NotFoundPage />} />
+          </Routes>
+        </Suspense>
+      </div>
+
+      {location.pathname === '/' ? (
+        <footer className="footer-shell footer-shell--landing">
+          <div className="footer-brand">
+            <BrandMark tagline="Premium logistics SaaS for booking, tracking, and enterprise dispatch." compact />
+          </div>
+
+          <div className="landing-footer-columns">
+            <div className="landing-footer-column">
+              <h3>Company</h3>
+              <a href="#top">Homepage</a>
+              <a href="#features">Platform</a>
+              <a href="#pricing">Pricing</a>
+            </div>
+
+            <div className="landing-footer-column">
+              <h3>Support</h3>
+              <Link to="/support" className="landing-footer-link">AI Assistant</Link>
+              <a href="mailto:support@skdlstransport.com">support@skdlstransport.com</a>
+              <a href="mailto:ops@skdlstransport.com">ops@skdlstransport.com</a>
+            </div>
+
+            <div className="landing-footer-column">
+              <h3>Social</h3>
+              <div className="landing-footer-socials">
+                <a href="https://www.linkedin.com" target="_blank" rel="noreferrer">LinkedIn</a>
+                <a href="https://x.com" target="_blank" rel="noreferrer">X</a>
+                <a href="https://www.youtube.com" target="_blank" rel="noreferrer">YouTube</a>
+              </div>
+            </div>
+          </div>
+        </footer>
+      ) : (
+        <footer className="footer-shell">
+          <div className="footer-brand">
+            <span className="footer-mark" aria-hidden="true">SK</span>
+            <div className="footer-copy">
+              <strong>SKDLS Transportations</strong>
+              <span>Premium logistics operations powered by live bookings, tracking, and payments.</span>
+            </div>
+          </div>
+
+          <div className="footer-actions">
+            <span className="footer-pill">Secure JWT</span>
+            <span className="footer-pill">Razorpay ready</span>
+            <span className="footer-pill">Live fleet sync</span>
+          </div>
+        </footer>
+      )}
+    </main>
+  )
+}
+
 function App() {
   return (
     <Router>
-      <main className="app">
-        <nav className="navbar">
-          <Link to="/" className="navbar-logo">
-            SKDLS Transportations
-          </Link>
-          <div className="nav-links">
-            {navLinks.map((link) => (
-              <Link to={link.path} key={link.name} className="nav-link">
-                {link.name}
-              </Link>
-            ))}
-          </div>
-        </nav>
-
-        <Routes>
-          <Route path="/" element={<HomePage />} />
-          <Route path="/loading" element={<LoadingPage />} />
-          <Route path="/unloading" element={<ServicePage title="Unloading" />} />
-          <Route path="/transportation" element={<ServicePage title="Transportation" />} />
-          <Route path="/tracking" element={<Tracking />} />
-          <Route path="/support" element={<Chat />} />
-        </Routes>
-
-        <footer>© 2026 SKDLS Transportations</footer>
-      </main>
+      <AppContent />
     </Router>
   )
 }

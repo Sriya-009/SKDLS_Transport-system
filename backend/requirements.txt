@@ -1,6 +1,15 @@
 flask
 flask-cors
+flask-limiter
+flask-jwt-extended
+flask-socketio
 mysql-connector-python
 google-generativeai
+openai
 python-dotenv
 gunicorn
+requests
+celery
+redis
+pytest
+pytest-cov

@@ -2,45 +2,61 @@
 
 ## Target architecture
 
-- React/Vite frontend hosted in S3 and distributed by CloudFront
+- React/Vite frontend built on EC2 and served by Nginx
 - Flask backend running on EC2 with Gunicorn behind Nginx
+- PM2 used to supervise the Gunicorn process
 - AWS RDS MySQL as the database
-- Gemini API accessed from the Flask backend via `GEMINI_API_KEY`
+- Twilio WhatsApp, Razorpay, and Gemini API accessed from the Flask backend
 
 ## Environment variables
 
 Set these in `backend/.env` on EC2:
 
+- `FLASK_ENV=production`
+- `SECRET_KEY`
 - `GEMINI_API_KEY`
+- `GEMINI_MODEL_NAME`
 - `DB_HOST`
 - `DB_USER`
 - `DB_PASSWORD`
 - `DB_NAME`
 - `DB_PORT`
 - `CORS_ORIGINS`
-- `SECRET_KEY`
 - `SESSION_COOKIE_SECURE=true`
+- `SESSION_COOKIE_SAMESITE=Lax`
+- `API_RATE_LIMIT=120 per minute`
+- `RATELIMIT_STORAGE_URI=memory://`
+- `MAX_CONTENT_LENGTH_BYTES=10485760`
+- `GUNICORN_BIND=127.0.0.1:8000`
+- `GUNICORN_WORKERS=3`
+- `GUNICORN_THREADS=4`
+- `GUNICORN_TIMEOUT=120`
+- `GUNICORN_KEEPALIVE=5`
+- `TWILIO_ACCOUNT_SID`
+- `TWILIO_AUTH_TOKEN`
+- `TWILIO_WHATSAPP_FROM_NUMBER`
 
 Set this in the frontend build environment:
 
-- `VITE_API_BASE_URL=https://api.your-domain.com`
+- `VITE_API_BASE_URL=/api`
 
 ## EC2 setup
 
 1. Launch an Amazon Linux 2023 or Ubuntu EC2 instance.
-2. Attach an IAM role if you plan to deploy from EC2 to S3.
-3. Open security groups for:
+2. Open security groups for:
    - `22` from your IP for SSH
    - `80` from the internet for Nginx
    - `443` from the internet for HTTPS
-   - `5000` only if you want to test Gunicorn directly; not required in production
-4. Install system packages.
+   - `8000` only if you want to test Gunicorn directly; not required in production
+3. Install system packages.
 
 ### Exact EC2 commands
 
 ```bash
-sudo dnf update -y || sudo apt update -y
-sudo dnf install -y git nginx python3 python3-pip python3-devel || sudo apt install -y git nginx python3 python3-pip python3-venv build-essential
+sudo apt update -y
+sudo apt install -y git nginx python3 python3-pip python3-venv build-essential curl
+sudo apt install -y certbot python3-certbot-nginx
+sudo npm install -g pm2
 sudo systemctl enable nginx
 sudo systemctl start nginx
 ```
@@ -48,40 +64,41 @@ sudo systemctl start nginx
 ```bash
 cd /var/www
 sudo git clone https://github.com/YOUR_ORG/YOUR_REPO.git transport-system
-sudo chown -R ec2-user:ec2-user /var/www/transport-system
+sudo chown -R ubuntu:ubuntu /var/www/transport-system
 cd /var/www/transport-system
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r backend/requirements.txt
+npm install
 ```
 
 ## Backend deployment
 
-1. Copy `deployment/backend.service` to `/etc/systemd/system/transport-system-backend.service`.
-2. Copy `deployment/nginx/transport-system.conf` to `/etc/nginx/conf.d/transport-system.conf`.
-3. Place `backend/.env` on the EC2 instance.
-4. Start Gunicorn through systemd.
-
-### Exact systemd service file
-
-Use the file in [deployment/backend.service](deployment/backend.service).
+1. Copy `deployment/nginx/transport-system.conf` to `/etc/nginx/sites-available/transport-system.conf`.
+2. Enable the site and reload Nginx.
+3. Start Gunicorn with PM2 using `deployment/pm2/ecosystem.config.cjs`.
+4. Place `backend/.env` on the EC2 instance.
 
 ### Exact Nginx config
 
 Use the file in [deployment/nginx/transport-system.conf](deployment/nginx/transport-system.conf).
 
+### Exact PM2 config
+
+Use the file in [deployment/pm2/ecosystem.config.cjs](deployment/pm2/ecosystem.config.cjs).
+
 ### Exact backend commands
 
 ```bash
-sudo cp deployment/backend.service /etc/systemd/system/transport-system-backend.service
-sudo systemctl daemon-reload
-sudo systemctl enable transport-system-backend
-sudo systemctl start transport-system-backend
-sudo systemctl status transport-system-backend --no-pager
+pm2 start deployment/pm2/ecosystem.config.cjs --update-env
+pm2 save
+pm2 status transport-system-backend
 ```
 
 ```bash
-sudo cp deployment/nginx/transport-system.conf /etc/nginx/conf.d/transport-system.conf
+sudo cp deployment/nginx/transport-system.conf /etc/nginx/sites-available/transport-system.conf
+sudo ln -sf /etc/nginx/sites-available/transport-system.conf /etc/nginx/sites-enabled/transport-system.conf
+sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t
 sudo systemctl restart nginx
 ```
@@ -91,51 +108,73 @@ sudo systemctl restart nginx
 The backend is ready for:
 
 ```bash
-gunicorn app:app --workers 3 --timeout 120
+cd /var/www/transport-system/backend
+gunicorn -c gunicorn.conf.py app:app
 ```
 
 `backend/gunicorn.conf.py` keeps the same worker and timeout values while routing logs to `backend/logs/`.
 
 ## Frontend deployment
 
-1. Build the frontend with `VITE_API_BASE_URL` pointing at the backend domain.
-2. Upload `frontend/dist/` to the S3 bucket configured for static website hosting or private origin access.
-3. Put CloudFront in front of the bucket.
+1. Build the frontend with `VITE_API_BASE_URL=/api`.
+2. Copy `frontend/dist/` into `/var/www/transport-system/frontend/dist` so Nginx can serve it.
+3. Reload Nginx after each build.
 
-### Exact S3 deployment steps
+### Exact build commands
 
 ```bash
-cd frontend
+cd /var/www/transport-system
 npm install
-VITE_API_BASE_URL=https://api.your-domain.com npm run build
-aws s3 sync dist s3://your-frontend-bucket --delete
+npm run build
+sudo systemctl reload nginx
 ```
-
-### CloudFront setup
-
-1. Create an S3 bucket for the frontend build output.
-2. Use Origin Access Control so the bucket stays private.
-3. Create a CloudFront distribution with the S3 bucket as the origin.
-4. Set the default root object to `index.html`.
-5. Configure a custom error response for SPA routing to return `index.html` on `403` and `404`.
 
 ## HTTPS
 
-- For CloudFront, use ACM in `us-east-1`.
-- For the EC2 backend, either terminate TLS on Nginx with a certificate from Let’s Encrypt or place an ALB in front of EC2 with ACM.
-- Update `CORS_ORIGINS` to the final frontend domain.
+- Use Certbot with the Nginx plugin on the EC2 instance.
+
+### Exact Certbot commands
+
+```bash
+sudo certbot --nginx -d your-domain.com -d www.your-domain.com
+sudo certbot renew --dry-run
+```
+
+### Nginx SSL config
+
+Use the file in [deployment/nginx/transport-system.conf](deployment/nginx/transport-system.conf). Replace the `your-domain.com` placeholders with your real domain before deploying.
 
 ## Logging
 
 - Application logs rotate in `backend/logs/application.log`
 - Error logs rotate in `backend/logs/error.log`
 - Gunicorn access and error logs are configured in `backend/gunicorn.conf.py`
+- Nginx access and error logs use the system defaults unless you override them in the server block
+
+## PM2
+
+PM2 keeps the backend alive and restarts it on failure.
+
+### Exact PM2 commands
+
+```bash
+pm2 start deployment/pm2/ecosystem.config.cjs --update-env
+pm2 save
+pm2 startup systemd -u ubuntu --hp /home/ubuntu
+```
+
+To reload after code changes:
+
+```bash
+pm2 reload transport-system-backend --update-env
+```
 
 ## Validation
 
 Run these before shipping:
 
 ```bash
-python -m py_compile backend/app.py
+npm install
+python -m py_compile backend/app.py backend/db.py backend/whatsapp_service.py
 npm run build
 ```

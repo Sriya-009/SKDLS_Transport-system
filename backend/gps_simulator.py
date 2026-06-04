@@ -1,6 +1,7 @@
 import threading
 import time
 import math
+import random
 import requests
 import mysql.connector
 from mysql.connector import Error
@@ -13,7 +14,7 @@ print = log_print
 class GPSSimulator:
     """Background GPS simulator for realistic lorry movement."""
     
-    def __init__(self, db_config, table_map):
+    def __init__(self, db_config, table_map, on_update_callback=None):
         """
         Initialize GPS simulator.
         
@@ -26,6 +27,15 @@ class GPSSimulator:
         self.running = False
         self.thread = None
         self.update_interval = 10  # seconds
+        self.on_update_callback = on_update_callback
+        self.last_updates = []
+        # traffic simulation parameters
+        self.traffic_chance = 0.2
+        self.min_traffic_slowdown = 0.3
+        self.max_traffic_slowdown = 0.8
+
+    def set_update_callback(self, callback):
+        self.on_update_callback = callback
 
     def _get_table_columns(self, table_name):
         connection = None
@@ -75,6 +85,8 @@ class GPSSimulator:
                 self._simulate_step()
             except Exception as e:
                 print(f"[GPS Simulator] Error in simulation step: {e}")
+            finally:
+                self._notify_update()
             
             # Sleep in small increments to allow graceful shutdown
             for _ in range(self.update_interval):
@@ -91,6 +103,21 @@ class GPSSimulator:
                 self._update_lorry_position(booking)
             except Exception as e:
                 print(f"[GPS Simulator] Error updating lorry {booking.get('lorry_number')}: {e}")
+
+    def _notify_update(self):
+        if not callable(self.on_update_callback):
+            # clear last updates regardless
+            self.last_updates = []
+            return
+
+        try:
+            # pass a copy of last updates for consumers
+            updates = list(self.last_updates)
+            # clear stored updates for next cycle
+            self.last_updates = []
+            self.on_update_callback(updates)
+        except Exception as e:
+            print(f"[GPS Simulator] Error broadcasting live update: {e}")
     
     def _get_active_bookings(self):
         """Query all active bookings from bookings table."""
@@ -260,6 +287,7 @@ class GPSSimulator:
     
     def _update_lorry_position(self, booking):
         """Update a lorry's position toward its destination."""
+        booking_id = booking.get("id")
         lorry_number = booking.get("lorry_number")
         source = booking.get("source_location")
         destination = booking.get("destination_location")
@@ -292,8 +320,18 @@ class GPSSimulator:
         distance_to_dest = self._get_distance_meters(current_lat, current_lon, dest_lat, dest_lon)
         bearing = self._calculate_bearing(current_lat, current_lon, dest_lat, dest_lon)
         
-        # Move 5 km (5000 meters) per step toward destination
-        movement_distance = 5000
+        # Base movement per step (meters)
+        base_movement_distance = 5000
+
+        # Traffic simulation: random slowdown factor
+        slowdown_factor = 1.0
+        try:
+            if random.random() < self.traffic_chance:
+                slowdown_factor = float(random.uniform(self.min_traffic_slowdown, self.max_traffic_slowdown))
+        except Exception:
+            slowdown_factor = 1.0
+
+        movement_distance = int(base_movement_distance * slowdown_factor)
         
         # If closer than movement distance, snap to destination
         if distance_to_dest <= movement_distance:
@@ -303,6 +341,22 @@ class GPSSimulator:
         
         # Update database
         self._save_lorry_position(table_name, lorry_number, new_lat, new_lon)
+        self._save_gps_log(booking_id, lorry_number, new_lat, new_lon, source, destination)
+
+        # Record last update for on_update_callback consumers
+        try:
+            self.last_updates.append({
+                "booking_id": int(booking_id) if booking_id is not None else None,
+                "lorry_number": str(lorry_number),
+                "latitude": float(new_lat),
+                "longitude": float(new_lon),
+                "source_location": str(source or ""),
+                "destination_location": str(destination or ""),
+                "timestamp": datetime.utcnow().isoformat(sep=" ", timespec="seconds"),
+                "traffic_slowdown": round(1.0 - slowdown_factor, 2) if slowdown_factor < 1.0 else 0.0,
+            })
+        except Exception:
+            pass
     
     def _save_lorry_position(self, table_name, lorry_number, latitude, longitude):
         """Save updated position to database."""
@@ -330,6 +384,40 @@ class GPSSimulator:
             connection.commit()
         except Error as e:
             print(f"[GPS Simulator] Error saving lorry position: {e}")
+        finally:
+            if cursor:
+                cursor.close()
+            if connection and connection.is_connected():
+                connection.close()
+
+    def _save_gps_log(self, booking_id, lorry_number, latitude, longitude, source_location, destination_location):
+        """Persist each GPS update for tracking history and dashboard playback."""
+        connection = None
+        cursor = None
+
+        try:
+            connection = mysql.connector.connect(**self.db_config)
+            cursor = connection.cursor()
+
+            cursor.execute(
+                """
+                INSERT INTO gps_logs
+                    (booking_id, lorry_number, latitude, longitude, source_location, destination_location, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    int(booking_id) if booking_id is not None else None,
+                    str(lorry_number),
+                    float(latitude),
+                    float(longitude),
+                    str(source_location or "").strip() or None,
+                    str(destination_location or "").strip() or None,
+                    datetime.now().isoformat(),
+                ),
+            )
+            connection.commit()
+        except Error as e:
+            print(f"[GPS Simulator] Error saving GPS log: {e}")
         finally:
             if cursor:
                 cursor.close()

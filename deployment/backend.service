@@ -8,7 +8,7 @@ Group=nginx
 WorkingDirectory=/var/www/transport-system/backend
 Environment="PATH=/var/www/transport-system/.venv/bin"
 EnvironmentFile=/var/www/transport-system/backend/.env
-ExecStart=/var/www/transport-system/.venv/bin/gunicorn --workers 3 --timeout 120 app:app
+ExecStart=/var/www/transport-system/.venv/bin/gunicorn -c /var/www/transport-system/backend/gunicorn.conf.py app:app
 Restart=always
 RestartSec=5
 

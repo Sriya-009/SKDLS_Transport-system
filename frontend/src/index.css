@@ -1,14 +1,29 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Manrope:wght@500;600;700;800&family=Poppins:wght@600;700;800&display=swap');
+
 :root {
-  --text: #aeb8c9;
-  --text-h: #f7fbff;
+  --text: #cbd5e1;
+  --text-muted: #94a3b8;
+  --text-h: #f8fafc;
   --bg: #08111f;
-  --border: rgba(255, 255, 255, 0.1);
-  --shadow: rgba(0, 0, 0, 0.22) 0 18px 40px -18px;
+  --surface: #0f172a;
+  --surface-strong: #111827;
+  --border: rgba(148, 163, 184, 0.14);
+  --shadow: 0 18px 40px -18px rgba(0, 0, 0, 0.22);
 
-  --sans: Inter, 'Segoe UI', Helvetica, Arial, sans-serif;
-  --heading: 'Trebuchet MS', 'Segoe UI', Helvetica, Arial, sans-serif;
+  --brand-primary: #f97316;
+  --brand-primary-strong: #fb923c;
+  --brand-secondary: #38bdf8;
+  --brand-success: #22c55e;
+  --brand-warning: #f59e0b;
+  --brand-gradient: linear-gradient(135deg, #f97316 0%, #fb923c 48%, #f59e0b 100%);
+  --brand-gradient-surface: linear-gradient(180deg, rgba(15, 23, 42, 0.94), rgba(8, 15, 28, 0.98));
+  --brand-glow: radial-gradient(circle at top left, rgba(249, 115, 22, 0.16), transparent 28%), radial-gradient(circle at 85% 25%, rgba(56, 189, 248, 0.12), transparent 22%);
 
-  font: 16px/1.5 var(--sans);
+  --font-body: 'Inter', 'Manrope', sans-serif;
+  --font-display: 'Manrope', 'Inter', sans-serif;
+  --font-brand: 'Poppins', 'Manrope', sans-serif;
+
+  font: 16px/1.5 var(--font-body);
   color: var(--text);
   background:
     radial-gradient(circle at top left, rgba(125, 211, 252, 0.16), transparent 34%),
@@ -37,7 +52,7 @@ body {
 
 body,
 button {
-  font-family: var(--sans);
+  font-family: var(--font-body);
 }
 
 button {
@@ -54,7 +69,7 @@ p {
 h1,
 h2,
 h3 {
-  font-family: var(--heading);
+  font-family: var(--font-display);
   font-weight: 700;
   color: var(--text-h);
 }
