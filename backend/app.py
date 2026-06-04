@@ -23,17 +23,15 @@ from flask_limiter.util import get_remote_address
 from flask_jwt_extended import (
     JWTManager,
     create_access_token,
-    create_refresh_token,
-    get_csrf_token,
     get_jwt,
     get_jwt_identity,
     jwt_required,
     verify_jwt_in_request,
     set_access_cookies,
-    set_refresh_cookies,
     unset_jwt_cookies,
 )
 from flask_socketio import SocketIO
+import google.generativeai as genai
 import requests
 from gps_simulator import GPSSimulator
 from db import DB_CONFIG, get_db_connection, get_vehicle_by_code, test_db_connection, save_chat_history, save_conversation_json, validate_db_environment, initialize_schema
@@ -58,64 +56,21 @@ from whatsapp_service import (
 )
 from logistics_workflows import LogisticsWorkflowService
 
-BASE_DIR = os.path.dirname(__file__)
-ENV_PATH = os.path.join(BASE_DIR, ".env")
-load_dotenv(dotenv_path=ENV_PATH)
-
-try:
-    import google.generativeai as genai
-except Exception:
-    genai = None
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 logger = setup_logger()
 print = log_print
 
 
 def _parse_cors_origins(value):
-    raw_value = str(value or '').strip()
-    origins = []
-
-    for match in re.findall(r"https?://[^\s,\]\)]+", raw_value):
-        origins.append(match.strip())
-
-    if not origins:
-        cleaned = raw_value.strip("[]")
-        origins = [item.strip().strip("[]()") for item in cleaned.split(',') if item.strip()]
-
-    origins = list(dict.fromkeys(origin for origin in origins if origin))
+    origins = [item.strip() for item in str(value or '').split(',') if item.strip()]
     if origins:
         return origins
 
     return [
-        os.getenv('FRONTEND_ORIGIN', '').strip() or 'http://34.200.212.3',
-        'http://127.0.0.1:5173',
         'http://localhost:5173',
+        'http://127.0.0.1:5173',
     ]
-
-
-def _get_bool_env(name, default=False):
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _get_int_env(name, default):
-    try:
-        return int(str(os.getenv(name, default)).strip())
-    except (TypeError, ValueError):
-        return default
-
-
-def _is_placeholder_secret(value):
-    normalized = str(value or "").strip().lower()
-    return normalized in {
-        "",
-        "your_gemini_api_key",
-        "replace_with_generated_secret",
-        "replace_with_generated_jwt_secret",
-        "change-me-in-production",
-    }
 
 
 def _current_timestamp():
@@ -123,19 +78,17 @@ def _current_timestamp():
 
 
 ALLOWED_CORS_ORIGINS = _parse_cors_origins(os.getenv('CORS_ORIGINS'))
-SOCKETIO_ASYNC_MODE = os.getenv('SOCKETIO_ASYNC_MODE', 'threading').strip() or 'threading'
 
 app = Flask(__name__)
 app.config.from_object(ProductionConfig)
-app.config['ENV'] = os.getenv('FLASK_ENV', 'development')
+app.config['ENV'] = os.getenv('FLASK_ENV', 'production')
 app.config['DEBUG'] = False
-app.config['MAX_CONTENT_LENGTH'] = _get_int_env('MAX_CONTENT_LENGTH_BYTES', 10 * 1024 * 1024)
+app.config['MAX_CONTENT_LENGTH'] = int(os.getenv('MAX_CONTENT_LENGTH_BYTES', str(10 * 1024 * 1024)))
 jwt = JWTManager(app)
 socketio = SocketIO(
     app,
     cors_allowed_origins=ALLOWED_CORS_ORIGINS,
-    async_mode=SOCKETIO_ASYNC_MODE,
-    message_queue=os.getenv("SOCKETIO_MESSAGE_QUEUE") or None,
+    async_mode=os.getenv('SOCKETIO_ASYNC_MODE', 'threading'),
     logger=False,
     engineio_logger=False,
 )
@@ -159,14 +112,6 @@ MONITORING_BUCKETS_SECONDS = [0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
 # Active streaming tasks: stream_id -> {cancelled: bool, started_at: float}
 ACTIVE_STREAMS = {}
 STREAMS_LOCK = Lock()
-CSRF_EXEMPT_PATHS = {
-    "/webhooks/razorpay",
-    "/api/webhooks/events",
-    "/gps/ingest",
-    "/gps/driver-heartbeat",
-    "/health/live",
-    "/health/ready",
-}
 
 CORS(
     app,
@@ -198,23 +143,6 @@ def log_request_info():
         pass
 
 
-@app.before_request
-def enforce_enterprise_csrf_header():
-    if request.method in {"GET", "HEAD", "OPTIONS"}:
-        return None
-    if request.path in CSRF_EXEMPT_PATHS or request.path.startswith("/webhooks/"):
-        return None
-    if request.headers.get("Authorization"):
-        return None
-    if request.cookies.get("access_token_cookie") and not (
-        request.headers.get(app.config.get("JWT_COOKIE_CSRF_HEADER_NAME", "X-CSRF-TOKEN"))
-        or request.headers.get("X-CSRFToken")
-        or request.headers.get("X-CSRF-Token")
-    ):
-        return jsonify({"status": "error", "message": "Missing CSRF token"}), 401
-    return None
-
-
 @app.after_request
 def set_security_headers(response):
     try:
@@ -225,9 +153,6 @@ def set_security_headers(response):
         response.headers.setdefault('X-XSS-Protection', '1; mode=block')
         response.headers.setdefault('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload')
         response.headers.setdefault('Permissions-Policy', 'geolocation=(self), microphone=(), camera=()')
-        response.headers.setdefault('Cross-Origin-Resource-Policy', 'same-origin')
-        response.headers.setdefault('X-Permitted-Cross-Domain-Policies', 'none')
-        response.headers.setdefault('X-Correlation-Id', request.headers.get('X-Correlation-Id') or request.headers.get('X-Request-Id') or str(uuid.uuid4()))
     except Exception:
         pass
     return response
@@ -240,8 +165,6 @@ def handle_unexpected_error(error):
         logger.exception(f"[unhandled_exception] {error}\n{tb}")
     except Exception:
         pass
-    if app.config.get("ENV") == "development" and _get_bool_env("EXPOSE_INTERNAL_ERRORS", False):
-        return jsonify({"status": "error", "message": str(error)}), 500
     return jsonify({"status": "error", "message": "Internal server error"}), 500
 
 
@@ -262,20 +185,6 @@ def health_ready():
     except Exception:
         logger.exception('[health][ready] database check failed')
         return jsonify({'status': 'error', 'message': 'db-unavailable'}), 503
-
-
-@app.route('/health/background', methods=['GET'])
-def health_background():
-    redis_url = os.getenv("REDIS_URL") or os.getenv("CELERY_BROKER_URL") or "redis://localhost:6379/0"
-    try:
-        import redis
-
-        client = redis.Redis.from_url(redis_url, socket_connect_timeout=2, socket_timeout=2)
-        client.ping()
-        return jsonify({"status": "ready", "redis": "ok", "broker": redis_url.split("@")[-1]}), 200
-    except Exception as error:
-        logger.warning(f"[health][background][warning] {error}")
-        return jsonify({"status": "degraded", "redis": "unavailable"}), 503
 
 
 def _normalize_auth_text(value):
@@ -406,26 +315,6 @@ def _build_access_token_for_user(user_row):
         "full_name": str(user_row.get("full_name") or "").strip(),
     }
     return create_access_token(identity=identity, additional_claims=additional_claims)
-
-
-def _build_refresh_token_for_user(user_row):
-    identity = str(user_row["id"])
-    additional_claims = {
-        "role": str(user_row.get("role") or "customer").strip() or "customer",
-        "token_use": "refresh",
-    }
-    return create_refresh_token(identity=identity, additional_claims=additional_claims)
-
-
-def _attach_auth_cookies(response, access_token, refresh_token=None):
-    set_access_cookies(response, access_token)
-    if refresh_token:
-        set_refresh_cookies(response, refresh_token)
-    try:
-        response.headers["X-CSRF-TOKEN"] = get_csrf_token(access_token)
-    except Exception:
-        pass
-    return response
 
 
 def _auth_response_payload(user_row):
@@ -983,11 +872,16 @@ TRUCK_SPEEDS_KMPH = {
     "16": 48,
 }
 
-if genai is not None and GEMINI_API_KEY and not _is_placeholder_secret(GEMINI_API_KEY):
+try:
+    import genai  # type: ignore
+except Exception:
+    genai = None
+
+if genai is not None and GEMINI_API_KEY:
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-    except Exception as error:
-        logger.warning(f"[startup][ai] Gemini configure failed: {error}")
+    except Exception:
+        pass
 
 
 # ============================================================================
@@ -1003,36 +897,12 @@ GEMINI_TIMEOUT_SECONDS = 10
 def _get_gemini_model():
     """Reuse Gemini model instance for performance."""
     global GEMINI_MODEL
-    if GEMINI_MODEL is None and GEMINI_API_KEY and not _is_placeholder_secret(GEMINI_API_KEY) and genai is not None:
+    if GEMINI_MODEL is None and GEMINI_API_KEY and genai is not None:
         try:
             GEMINI_MODEL = genai.GenerativeModel(GEMINI_MODEL_NAME)
-        except Exception as error:
-            logger.warning(f"[startup][ai] Gemini model initialization failed: {error}")
+        except Exception:
             GEMINI_MODEL = None
     return GEMINI_MODEL
-
-
-def _log_ai_startup_state():
-    key_loaded = bool(GEMINI_API_KEY)
-    if genai is None:
-        logger.warning("[startup][ai] AI initialized status=disabled provider=gemini reason=package_unavailable")
-        return False
-
-    if not key_loaded:
-        logger.warning("[startup][ai] AI initialized status=disabled provider=gemini reason=missing_api_key")
-        return False
-
-    if _is_placeholder_secret(GEMINI_API_KEY):
-        logger.warning("[startup][ai] AI initialized status=disabled provider=gemini reason=placeholder_api_key")
-        return False
-
-    model = _get_gemini_model()
-    if model is None:
-        logger.warning(f"[startup][ai] AI initialized status=disabled provider=gemini model={GEMINI_MODEL_NAME}")
-        return False
-
-    logger.info(f"[startup][ai] AI initialized status=ready provider=gemini model={GEMINI_MODEL_NAME}")
-    return True
 
 # System prompt for conversational AI
 SYSTEM_PROMPT = """You are SKDLS Transportations AI assistant.
@@ -1401,16 +1271,7 @@ Reply MUST be conversational, friendly, and context-aware. DO NOT make the user 
 
         provider = LLMProvider(logger=logger)
         try:
-            reply_text = provider.generate(
-                prompt,
-                max_tokens=180,
-                temperature=0.45,
-                timeout=10,
-                retries=2,
-                stream=False,
-                user_id=db_context.get("user_id"),
-                session_id=db_context.get("session_id"),
-            )
+            reply_text = provider.generate(prompt, max_tokens=180, temperature=0.45, timeout=10, retries=2, stream=False)
             if isinstance(reply_text, (list, tuple)):
                 reply_text = "".join(reply_text)
             reply_text = str(reply_text or "").strip()
@@ -2399,17 +2260,7 @@ def _stream_llm_worker(stream_id, message, user_id=None, session_id=None, timeou
                 _emit_stream_event("ai:stream:chunk", {**metadata, "chunk": chunk})
             metadata.update(structured_payload)
         else:
-            gen = provider.generate(
-                message,
-                max_tokens=1024,
-                temperature=0.4,
-                timeout=timeout_seconds,
-                retries=2,
-                stream=True,
-                provider=provider_name,
-                user_id=user_id,
-                session_id=session_id,
-            )
+            gen = provider.generate(message, max_tokens=1024, temperature=0.4, timeout=timeout_seconds, retries=2, stream=True, provider=provider_name)
 
             # generator may be a generator or a string; handle both
             chunks = [gen] if isinstance(gen, str) else gen
@@ -3102,75 +2953,34 @@ def _build_fleet_tracking_payload(booking_row):
     if not lorry_number:
         return None
 
-    driver_row = _fetch_driver_by_lorry_number(lorry_number)
-    driver_id = int(driver_row.get("id")) if driver_row and driver_row.get("id") is not None else None
-    latest_driver_location = _fetch_latest_driver_location(lorry_number=lorry_number, driver_id=driver_id)
-    active_shipment = _fetch_active_shipment_for_lorry(lorry_number, driver_id=driver_id)
-
     tracking_data = None
     try:
         tracking_data = get_lorry_tracking_data(lorry_number)
     except RuntimeError:
         tracking_data = None
 
-    if (not tracking_data or tracking_data.get("message")) and latest_driver_location:
-        tracking_data = {
-            "lorry_number": lorry_number,
-            "latitude": latest_driver_location.get("latitude"),
-            "longitude": latest_driver_location.get("longitude"),
-            "last_updated": latest_driver_location.get("recorded_at") or latest_driver_location.get("created_at"),
-            "speed_kmph": latest_driver_location.get("speed_kmph"),
-            "heading_degrees": latest_driver_location.get("heading_degrees"),
-        }
-
-    pickup_location = str(booking_row.get("pickup_location") or booking_row.get("source_location") or "").strip()
-    destination_location = str(booking_row.get("drop_location") or booking_row.get("destination_location") or "").strip()
-    truck_type_code = _normalize_truck_type(booking_row.get("tyre_type") or booking_row.get("truck_type"), booking_row.get("tons"))
-    truck_label = _canonical_truck_type_label(truck_type_code) if truck_type_code else str(booking_row.get("tyre_type") or booking_row.get("truck_type") or "")
-    driver_payload = {
-        "id": driver_id,
-        "name": str((driver_row or {}).get("driver_name") or (driver_row or {}).get("full_name") or (driver_row or {}).get("name") or "").strip(),
-        "phone": str((driver_row or {}).get("phone") or (driver_row or {}).get("mobile") or "").strip(),
-        "status": str((driver_row or {}).get("status") or "").strip(),
-    } if driver_row else None
-
     if not tracking_data or tracking_data.get("message"):
-        heartbeat = _tracking_heartbeat_state(None)
         return {
             "booking_id": int(booking_row.get("id")),
-            "shipment_id": int(active_shipment.get("id")) if active_shipment and active_shipment.get("id") is not None else None,
-            "driver_id": driver_id,
-            "driver": driver_payload,
             "lorry_number": lorry_number,
-            "truck_type": truck_label,
+            "truck_type": str(booking_row.get("tyre_type") or booking_row.get("truck_type") or ""),
             "booking_status": str(booking_row.get("booking_status") or "pending"),
-            "shipment_status": str((active_shipment or {}).get("shipment_status") or booking_row.get("booking_status") or "pending"),
-            "pickup_location": pickup_location,
-            "drop_location": destination_location,
+            "pickup_location": str(booking_row.get("pickup_location") or booking_row.get("source_location") or "").strip(),
+            "drop_location": str(booking_row.get("drop_location") or booking_row.get("destination_location") or "").strip(),
             "latitude": None,
             "longitude": None,
             "last_updated": "",
-            "speed_kmph": None,
-            "heading_degrees": None,
             "distance_km": None,
             "eta_hours": None,
             "route_coordinates": [],
-            "route_progress": {"percent": 0, "nearest_index": 0, "remaining_points": 0},
-            "geofences": [],
-            "heartbeat": heartbeat,
-            "traffic": _traffic_state(),
-            "alerts": _tracking_alerts_for_state({"lorry_number": lorry_number, "heartbeat": heartbeat, "traffic": {}, "geofences": []}),
-            "timeline": _fetch_shipment_timeline(active_shipment.get("id")) if active_shipment and active_shipment.get("id") is not None else [],
             "gps_available": False,
         }
 
-    origin_coordinates = None
+    destination_location = str(booking_row.get("drop_location") or booking_row.get("destination_location") or "").strip()
+    truck_type_code = _normalize_truck_type(booking_row.get("tyre_type") or booking_row.get("truck_type"), booking_row.get("tons"))
+    truck_label = _canonical_truck_type_label(truck_type_code) if truck_type_code else str(booking_row.get("tyre_type") or booking_row.get("truck_type") or "")
+
     destination_coordinates = None
-    if pickup_location:
-        try:
-            origin_coordinates = _get_coordinates(pickup_location)
-        except Exception:
-            origin_coordinates = None
     if destination_location:
         try:
             destination_coordinates = _get_coordinates(destination_location)
@@ -3178,18 +2988,8 @@ def _build_fleet_tracking_payload(booking_row):
             destination_coordinates = None
 
     route_coordinates = []
-    geofence_coordinates = []
     distance_km = None
     eta_hours = None
-
-    if origin_coordinates and destination_coordinates and _is_lat_lng_tuple(origin_coordinates) and _is_lat_lng_tuple(destination_coordinates):
-        planned_route = _get_route_geometry(
-            origin_coordinates[0],
-            origin_coordinates[1],
-            destination_coordinates[0],
-            destination_coordinates[1],
-        )
-        geofence_coordinates = planned_route.get("coordinates") or []
 
     if destination_coordinates and _is_lat_lng_tuple(destination_coordinates):
         route_info = _get_route_geometry(
@@ -3208,52 +3008,21 @@ def _build_fleet_tracking_payload(booking_row):
         except Exception:
             eta_hours = None
 
-    speed_kmph = _coerce_float_or_none(tracking_data.get("speed_kmph") or (latest_driver_location or {}).get("speed_kmph"))
-    heading_degrees = _coerce_float_or_none(tracking_data.get("heading_degrees") or (latest_driver_location or {}).get("heading_degrees"))
-    traffic = _traffic_state(speed_kmph=speed_kmph, slowdown=(tracking_data or {}).get("traffic_slowdown"))
-    if eta_hours is not None:
-        eta_hours = round(float(eta_hours) * float(traffic.get("eta_multiplier") or 1.0), 2)
-
-    heartbeat_timestamp = (
-        (latest_driver_location or {}).get("recorded_at")
-        or (latest_driver_location or {}).get("created_at")
-        or tracking_data.get("last_updated")
-    )
-    heartbeat = _tracking_heartbeat_state(heartbeat_timestamp, speed_kmph=speed_kmph)
-    route_progress = _calculate_route_progress(tracking_data["latitude"], tracking_data["longitude"], geofence_coordinates or route_coordinates)
-    geofences = _build_geofence_state(tracking_data["latitude"], tracking_data["longitude"], geofence_coordinates or route_coordinates)
-
-    payload = {
+    return {
         "booking_id": int(booking_row.get("id")),
-        "shipment_id": int(active_shipment.get("id")) if active_shipment and active_shipment.get("id") is not None else None,
-        "driver_id": driver_id,
-        "driver": driver_payload,
         "lorry_number": lorry_number,
         "truck_type": truck_label,
         "booking_status": str(booking_row.get("booking_status") or "pending"),
-        "shipment_status": str((active_shipment or {}).get("shipment_status") or booking_row.get("booking_status") or "pending"),
-        "pickup_location": pickup_location,
+        "pickup_location": str(booking_row.get("pickup_location") or booking_row.get("source_location") or "").strip(),
         "drop_location": destination_location,
         "latitude": float(tracking_data["latitude"]),
         "longitude": float(tracking_data["longitude"]),
-        "last_updated": _serialize_tracking_timestamp(heartbeat_timestamp) or str(tracking_data.get("last_updated") or ""),
-        "speed_kmph": speed_kmph,
-        "heading_degrees": heading_degrees,
+        "last_updated": str(tracking_data.get("last_updated") or ""),
         "distance_km": round(float(distance_km), 1) if distance_km is not None else None,
         "eta_hours": eta_hours,
         "route_coordinates": route_coordinates,
-        "optimized_route": route_coordinates,
-        "route_progress": route_progress,
-        "geofences": geofences,
-        "heartbeat": heartbeat,
-        "traffic": traffic,
-        "timeline": _fetch_shipment_timeline(active_shipment.get("id")) if active_shipment and active_shipment.get("id") is not None else [],
         "gps_available": True,
     }
-    payload["alerts"] = _tracking_alerts_for_state(payload)
-    payload["delay_alert"] = next((alert for alert in payload["alerts"] if alert.get("type") == "traffic_delay"), None)
-    payload["inactivity_alert"] = next((alert for alert in payload["alerts"] if alert.get("type") == "driver_inactive"), None)
-    return payload
 
 
 def _broadcast_live_fleet_update(updates=None):
@@ -3272,18 +3041,10 @@ def _broadcast_live_fleet_update(updates=None):
                         "destination_location": u.get("destination_location"),
                         "last_updated": u.get("timestamp"),
                         "traffic_slowdown": u.get("traffic_slowdown", 0.0),
-                        "speed_kmph": u.get("speed_kmph"),
-                        "heading_degrees": u.get("heading_degrees"),
                     }
-                    for booking_row in _find_booking_rows_by_lorry_number(payload["lorry_number"]):
-                        enriched = _build_fleet_tracking_payload(booking_row)
-                        if enriched:
-                            payload = {**enriched, **{key: value for key, value in payload.items() if value is not None}}
-                            break
                     trucks.append(payload)
                     # Per-truck socket
                     socketio.emit("truck:location", payload)
-                    socketio.emit("driver:heartbeat", {"lorry_number": payload.get("lorry_number"), "driver_id": payload.get("driver_id"), "heartbeat": payload.get("heartbeat")})
                 except Exception:
                     continue
 
@@ -3502,7 +3263,7 @@ def _get_gps_logs_for_lorry(lorry_number, limit=25):
         cursor = connection.cursor(dictionary=True)
         cursor.execute(
             """
-            SELECT *
+            SELECT lorry_number, latitude, longitude, source_location, destination_location, created_at
             FROM gps_logs
             WHERE lorry_number = %s
             ORDER BY created_at DESC, id DESC
@@ -3514,7 +3275,14 @@ def _get_gps_logs_for_lorry(lorry_number, limit=25):
         logs = []
         for row in rows:
             try:
-                logs.append(_tracking_log_payload(row))
+                logs.append({
+                    "lorry_number": str(row.get("lorry_number") or lorry_number),
+                    "latitude": float(row.get("latitude")),
+                    "longitude": float(row.get("longitude")),
+                    "source_location": str(row.get("source_location") or "").strip(),
+                    "destination_location": str(row.get("destination_location") or "").strip(),
+                    "created_at": row.get("created_at").isoformat(sep=" ", timespec="seconds") if row.get("created_at") else None,
+                })
             except Exception:
                 continue
         return logs
@@ -3523,487 +3291,6 @@ def _get_gps_logs_for_lorry(lorry_number, limit=25):
             cursor.close()
         if connection is not None and connection.is_connected():
             connection.close()
-
-
-def _coerce_float_or_none(value):
-    try:
-        if value in (None, ""):
-            return None
-        number = float(value)
-        if number != number:
-            return None
-        return number
-    except Exception:
-        return None
-
-
-def _serialize_tracking_timestamp(value):
-    if hasattr(value, "isoformat"):
-        return value.isoformat(sep=" ", timespec="seconds")
-    return str(value or "").strip() or None
-
-
-def _fetch_driver_by_lorry_number(lorry_number):
-    target = str(lorry_number or "").strip()
-    if not target:
-        return None
-
-    connection = None
-    cursor = None
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor(dictionary=True)
-        cursor.execute(
-            """
-            SELECT *
-            FROM drivers
-            WHERE assigned_truck = %s
-               OR assigned_truck_type = %s
-            ORDER BY status = 'available' DESC, id ASC
-            LIMIT 1
-            """,
-            (target, target),
-        )
-        return cursor.fetchone()
-    except Exception:
-        return None
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if connection is not None and connection.is_connected():
-            connection.close()
-
-
-def _fetch_active_shipment_for_lorry(lorry_number, driver_id=None):
-    connection = None
-    cursor = None
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor(dictionary=True)
-        if driver_id is not None:
-            cursor.execute(
-                f"""
-                SELECT *
-                FROM {SHIPMENTS_TABLE}
-                WHERE assigned_driver_id = %s
-                  AND shipment_status NOT IN ('delivered', 'completed', 'cancelled', 'failed')
-                ORDER BY created_at DESC, id DESC
-                LIMIT 1
-                """,
-                (int(driver_id),),
-            )
-            row = cursor.fetchone()
-            if row:
-                return row
-
-        booking_rows = _find_booking_rows_by_lorry_number(lorry_number)
-        for booking_row in booking_rows:
-            pickup = str(booking_row.get("source_location") or booking_row.get("pickup_location") or "").strip()
-            drop = str(booking_row.get("destination_location") or booking_row.get("drop_location") or "").strip()
-            if not pickup or not drop:
-                continue
-            cursor.execute(
-                f"""
-                SELECT *
-                FROM {SHIPMENTS_TABLE}
-                WHERE pickup_location = %s
-                  AND drop_location = %s
-                  AND shipment_status NOT IN ('delivered', 'completed', 'cancelled', 'failed')
-                ORDER BY created_at DESC, id DESC
-                LIMIT 1
-                """,
-                (pickup, drop),
-            )
-            row = cursor.fetchone()
-            if row:
-                return row
-        return None
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if connection is not None and connection.is_connected():
-            connection.close()
-
-
-def _fetch_latest_driver_location(lorry_number=None, driver_id=None):
-    connection = None
-    cursor = None
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor(dictionary=True)
-        if driver_id is not None:
-            cursor.execute(
-                """
-                SELECT *
-                FROM driver_locations
-                WHERE driver_id = %s
-                ORDER BY recorded_at DESC, id DESC
-                LIMIT 1
-                """,
-                (int(driver_id),),
-            )
-        else:
-            cursor.execute(
-                """
-                SELECT *
-                FROM driver_locations
-                WHERE lorry_number = %s
-                ORDER BY recorded_at DESC, id DESC
-                LIMIT 1
-                """,
-                (str(lorry_number or "").strip(),),
-            )
-        return cursor.fetchone()
-    except Exception:
-        return None
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if connection is not None and connection.is_connected():
-            connection.close()
-
-
-def _persist_driver_location(*, driver_id=None, shipment_id=None, booking_id=None, lorry_number, latitude, longitude, speed_kmph=None, heading_degrees=None, accuracy_meters=None, battery_level=None, heartbeat_status="online", source="gps", metadata=None):
-    connection = None
-    cursor = None
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor()
-        cursor.execute(
-            """
-            INSERT INTO driver_locations
-                (driver_id, shipment_id, booking_id, lorry_number, latitude, longitude, speed_kmph, heading_degrees, accuracy_meters, battery_level, heartbeat_status, source, metadata_json, recorded_at, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
-            """,
-            (
-                int(driver_id) if driver_id is not None else None,
-                int(shipment_id) if shipment_id is not None else None,
-                int(booking_id) if booking_id is not None else None,
-                str(lorry_number or "").strip(),
-                float(latitude),
-                float(longitude),
-                _coerce_float_or_none(speed_kmph),
-                _coerce_float_or_none(heading_degrees),
-                _coerce_float_or_none(accuracy_meters),
-                _coerce_float_or_none(battery_level),
-                str(heartbeat_status or "online").strip() or "online",
-                str(source or "gps").strip() or "gps",
-                json.dumps(metadata or {}, ensure_ascii=False),
-            ),
-        )
-        connection.commit()
-        return cursor.lastrowid
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if connection is not None and connection.is_connected():
-            connection.close()
-
-
-def _insert_tracking_notification(title, message, *, shipment_id=None, driver_id=None, user_id=None, notification_type="tracking_alert", metadata=None, status="unread"):
-    connection = None
-    cursor = None
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor()
-        cursor.execute(
-            """
-            INSERT INTO notifications
-                (user_id, driver_id, shipment_id, notification_type, title, message, status, metadata_json, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            """,
-            (
-                str(user_id or "").strip() or None,
-                int(driver_id) if driver_id is not None else None,
-                int(shipment_id) if shipment_id is not None else None,
-                str(notification_type or "tracking_alert").strip(),
-                str(title or "").strip(),
-                str(message or "").strip(),
-                str(status or "unread").strip() or "unread",
-                json.dumps(metadata or {}, ensure_ascii=False),
-            ),
-        )
-        connection.commit()
-        return cursor.lastrowid
-    except Exception as error:
-        logger.warning(f"[notifications][tracking][warning] {error}")
-        return None
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if connection is not None and connection.is_connected():
-            connection.close()
-
-
-def _gps_logs_for_booking(booking_id, limit=1000):
-    connection = None
-    cursor = None
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor(dictionary=True)
-        cursor.execute(
-            """
-            SELECT *
-            FROM gps_logs
-            WHERE booking_id = %s
-            ORDER BY created_at ASC, id ASC
-            LIMIT %s
-            """,
-            (int(booking_id), max(1, min(int(limit or 1000), 5000))),
-        )
-        return cursor.fetchall() or []
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if connection is not None and connection.is_connected():
-            connection.close()
-
-
-def _tracking_log_payload(row):
-    metadata = row.get("metadata_json")
-    if isinstance(metadata, str) and metadata.strip():
-        try:
-            metadata = json.loads(metadata)
-        except Exception:
-            metadata = {"raw": metadata}
-    elif not isinstance(metadata, dict):
-        metadata = {}
-
-    return {
-        "id": int(row.get("id") or 0),
-        "booking_id": int(row.get("booking_id")) if row.get("booking_id") is not None else None,
-        "shipment_id": int(row.get("shipment_id")) if row.get("shipment_id") is not None else None,
-        "driver_id": int(row.get("driver_id")) if row.get("driver_id") is not None else None,
-        "lorry_number": str(row.get("lorry_number") or "").strip(),
-        "latitude": float(row.get("latitude")),
-        "longitude": float(row.get("longitude")),
-        "speed_kmph": _coerce_float_or_none(row.get("speed_kmph")),
-        "heading_degrees": _coerce_float_or_none(row.get("heading_degrees")),
-        "source_location": str(row.get("source_location") or "").strip(),
-        "destination_location": str(row.get("destination_location") or "").strip(),
-        "event_type": str(row.get("event_type") or "gps_ping").strip() or "gps_ping",
-        "metadata": metadata,
-        "created_at": _serialize_tracking_timestamp(row.get("created_at")),
-    }
-
-
-def _calculate_route_progress(latitude, longitude, route_coordinates):
-    points = []
-    for point in route_coordinates or []:
-        if isinstance(point, (list, tuple)) and len(point) >= 2:
-            lat = _coerce_float_or_none(point[0])
-            lng = _coerce_float_or_none(point[1])
-            if lat is not None and lng is not None:
-                points.append((lat, lng))
-
-    if len(points) < 2:
-        return {"percent": 0, "nearest_index": 0, "remaining_points": len(points)}
-
-    current_lat = float(latitude)
-    current_lng = float(longitude)
-    nearest_index = min(
-        range(len(points)),
-        key=lambda index: _calculate_straight_line_distance_km(current_lat, current_lng, points[index][0], points[index][1]),
-    )
-    percent = round((nearest_index / max(len(points) - 1, 1)) * 100, 1)
-    return {"percent": percent, "nearest_index": nearest_index, "remaining_points": max(len(points) - nearest_index - 1, 0)}
-
-
-def _build_geofence_state(latitude, longitude, route_coordinates, radius_km=0.5):
-    if not route_coordinates or len(route_coordinates) < 2:
-        return []
-
-    current_lat = float(latitude)
-    current_lng = float(longitude)
-    zones = [
-        ("pickup", route_coordinates[0], "Pickup geofence"),
-        ("drop", route_coordinates[-1], "Drop geofence"),
-    ]
-    states = []
-    for zone_id, point, label in zones:
-        try:
-            zone_lat = float(point[0])
-            zone_lng = float(point[1])
-            distance_km = _calculate_straight_line_distance_km(current_lat, current_lng, zone_lat, zone_lng)
-            states.append({
-                "id": zone_id,
-                "label": label,
-                "center": [zone_lat, zone_lng],
-                "radius_meters": int(radius_km * 1000),
-                "distance_km": round(float(distance_km), 3),
-                "inside": float(distance_km) <= float(radius_km),
-            })
-        except Exception:
-            continue
-    return states
-
-
-def _tracking_heartbeat_state(last_seen, speed_kmph=None):
-    if not last_seen:
-        return {"status": "offline", "last_seen": None, "age_seconds": None, "inactive": True}
-
-    if hasattr(last_seen, "timestamp"):
-        age_seconds = max(0, int(time.time() - float(last_seen.timestamp())))
-    else:
-        try:
-            parsed = datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))
-            age_seconds = max(0, int(time.time() - float(parsed.timestamp())))
-        except Exception:
-            age_seconds = None
-
-    inactive_threshold = int(os.getenv("GPS_INACTIVITY_SECONDS", "300"))
-    stale_threshold = int(os.getenv("GPS_STALE_SECONDS", "120"))
-    if age_seconds is None:
-        status = "unknown"
-    elif age_seconds > inactive_threshold:
-        status = "inactive"
-    elif age_seconds > stale_threshold:
-        status = "stale"
-    else:
-        status = "online"
-
-    return {
-        "status": status,
-        "last_seen": _serialize_tracking_timestamp(last_seen),
-        "age_seconds": age_seconds,
-        "inactive": status in {"inactive", "offline"},
-        "moving": _coerce_float_or_none(speed_kmph) is not None and float(speed_kmph) >= 3,
-    }
-
-
-def _traffic_state(speed_kmph=None, slowdown=None):
-    speed = _coerce_float_or_none(speed_kmph)
-    slowdown_value = _coerce_float_or_none(slowdown) or 0.0
-    if slowdown_value >= 0.45 or (speed is not None and speed < 12):
-        level = "heavy"
-        eta_multiplier = 1.45
-    elif slowdown_value >= 0.2 or (speed is not None and speed < 28):
-        level = "moderate"
-        eta_multiplier = 1.2
-    else:
-        level = "clear"
-        eta_multiplier = 1.0
-    return {"level": level, "slowdown": round(float(slowdown_value), 2), "eta_multiplier": eta_multiplier}
-
-
-def _tracking_alerts_for_state(truck_payload):
-    alerts = []
-    heartbeat = truck_payload.get("heartbeat") or {}
-    traffic = truck_payload.get("traffic") or {}
-    geofences = truck_payload.get("geofences") or []
-    lorry_number = truck_payload.get("lorry_number") or "Truck"
-
-    if heartbeat.get("inactive"):
-        alerts.append({
-            "type": "driver_inactive",
-            "severity": "warning",
-            "message": f"{lorry_number} driver heartbeat is {heartbeat.get('status')}.",
-        })
-    if traffic.get("level") == "heavy":
-        alerts.append({
-            "type": "traffic_delay",
-            "severity": "warning",
-            "message": f"{lorry_number} is moving through heavy traffic.",
-        })
-    for zone in geofences:
-        if zone.get("inside"):
-            alerts.append({
-                "type": "geofence",
-                "severity": "info",
-                "message": f"{lorry_number} entered {zone.get('label')}.",
-            })
-    return alerts[:5]
-
-
-def _persist_tracking_alerts(truck_payload, shipment_row=None, driver_row=None):
-    alerts = truck_payload.get("alerts") or []
-    if not alerts:
-        return
-
-    shipment_id = int(shipment_row.get("id")) if shipment_row and shipment_row.get("id") is not None else None
-    driver_id = int(driver_row.get("id")) if driver_row and driver_row.get("id") is not None else None
-    user_id = str((shipment_row or {}).get("user_id") or "").strip() or None
-    for alert in alerts:
-        try:
-            _insert_tracking_notification(
-                "Tracking alert",
-                alert.get("message") or "Tracking alert",
-                shipment_id=shipment_id,
-                driver_id=driver_id,
-                user_id=user_id,
-                notification_type=alert.get("type") or "tracking_alert",
-                metadata={"truck": truck_payload, "alert": alert},
-            )
-            if shipment_id is not None:
-                _insert_shipment_event_log(
-                    shipment_id,
-                    alert.get("type") or "tracking_alert",
-                    title="Tracking alert",
-                    message=alert.get("message") or "Tracking alert",
-                    severity=alert.get("severity") or "warning",
-                    source="tracking.engine",
-                    metadata={"truck": truck_payload, "alert": alert},
-                )
-        except Exception:
-            continue
-
-
-def _progress_shipment_from_tracking(shipment_row, tracking_state):
-    if not shipment_row:
-        return None
-
-    shipment_id = int(shipment_row.get("id"))
-    current_status = str(shipment_row.get("shipment_status") or "pending").strip().lower()
-    if current_status in {"delivered", "completed", "cancelled", "failed"}:
-        return current_status
-
-    progress_percent = float((tracking_state.get("route_progress") or {}).get("percent") or 0)
-    geofences = tracking_state.get("geofences") or []
-    inside_pickup = any(zone.get("id") == "pickup" and zone.get("inside") for zone in geofences)
-    inside_drop = any(zone.get("id") == "drop" and zone.get("inside") for zone in geofences)
-    heartbeat = tracking_state.get("heartbeat") or {}
-    traffic = tracking_state.get("traffic") or {}
-
-    next_status = None
-    if inside_drop or progress_percent >= 97:
-        next_status = "delivered"
-    elif progress_percent >= 75:
-        next_status = "out_for_delivery"
-    elif progress_percent >= 8:
-        next_status = "in_transit"
-    elif inside_pickup and current_status in {"pending", "confirmed", "assigned"}:
-        next_status = "loading"
-    elif current_status == "pending":
-        next_status = "assigned" if shipment_row.get("assigned_driver_id") else "confirmed"
-
-    if heartbeat.get("inactive") or traffic.get("level") == "heavy":
-        next_status = "delayed" if current_status not in {"delayed", "out_for_delivery", "delivered"} else next_status
-
-    if not next_status or next_status == current_status:
-        return current_status
-
-    try:
-        _update_shipment_record(shipment_id, {"shipment_status": next_status})
-        _insert_shipment_status_log(
-            shipment_id,
-            next_status,
-            note=f"Automatic GPS status progression: {next_status}",
-            location="GPS",
-            actor_role="system",
-            metadata={"tracking_state": tracking_state},
-        )
-        _insert_shipment_event_log(
-            shipment_id,
-            "status_progression",
-            title="Shipment status updated by GPS",
-            message=f"Shipment progressed from {current_status} to {next_status}.",
-            severity="success" if next_status == "delivered" else "info",
-            source="tracking.engine",
-            metadata={"previous_status": current_status, "next_status": next_status, "tracking_state": tracking_state},
-        )
-    except Exception as error:
-        logger.warning(f"[tracking][status_progression][warning] {error}")
-    return next_status
 
 
 if gps_simulator is not None:
@@ -4514,7 +3801,6 @@ def _serialize_shipment_row(row):
         "payment_status": str(row.get("payment_status") or "pending").strip() or "pending",
         "shipment_status": str(row.get("shipment_status") or "pending").strip() or "pending",
         "assigned_driver_id": int(row["assigned_driver_id"]) if row.get("assigned_driver_id") is not None else None,
-        "lorry_number": str(row.get("lorry_number") or row.get("assigned_truck") or "").strip(),
         "created_at": row.get("created_at").isoformat(sep=" ", timespec="seconds") if row.get("created_at") else None,
         "booking_reference": f"SHP-{int(row['id']):06d}",
     }
@@ -6081,242 +5367,6 @@ def _fetch_payment_records_for_shipment(shipment_id):
             connection.close()
 
 
-def _fetch_payment_record_by_id(payment_id):
-    connection = None
-    cursor = None
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor(dictionary=True)
-        cursor.execute(f"SELECT * FROM {PAYMENTS_TABLE} WHERE id = %s LIMIT 1", (int(payment_id),))
-        return cursor.fetchone()
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if connection is not None and connection.is_connected():
-            connection.close()
-
-
-def _fetch_payment_record_by_payment_id(razorpay_payment_id):
-    connection = None
-    cursor = None
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor(dictionary=True)
-        cursor.execute(
-            f"SELECT * FROM {PAYMENTS_TABLE} WHERE razorpay_payment_id = %s LIMIT 1",
-            (str(razorpay_payment_id or "").strip(),),
-        )
-        return cursor.fetchone()
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if connection is not None and connection.is_connected():
-            connection.close()
-
-
-def _payment_is_successful(payment_row):
-    return str((payment_row or {}).get("payment_status") or (payment_row or {}).get("status") or "").strip().lower() in {"paid", "captured", "success"}
-
-
-def _payment_target_user_id(payment_row):
-    if not payment_row:
-        return None
-    try:
-        if payment_row.get("shipment_id") is not None:
-            shipment_row = _fetch_shipment_record_by_id(int(payment_row.get("shipment_id")))
-            return str((shipment_row or {}).get("user_id") or "").strip() or None
-        if payment_row.get("booking_id") is not None:
-            booking_row = _fetch_booking_record_by_id(int(payment_row.get("booking_id")))
-            return str((booking_row or {}).get("user_id") or (booking_row or {}).get("phone") or "").strip() or None
-    except Exception:
-        return None
-    return None
-
-
-def _get_wallet_balance(user_id):
-    if not user_id:
-        return 0
-    connection = None
-    cursor = None
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor(dictionary=True)
-        cursor.execute(
-            """
-            SELECT balance_after
-            FROM customer_wallet_ledger
-            WHERE user_id = %s
-            ORDER BY created_at DESC, id DESC
-            LIMIT 1
-            """,
-            (str(user_id),),
-        )
-        row = cursor.fetchone()
-        return int(row.get("balance_after") or 0) if row else 0
-    except Exception:
-        return 0
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if connection is not None and connection.is_connected():
-            connection.close()
-
-
-def _insert_wallet_ledger_entry(*, user_id=None, booking_id=None, shipment_id=None, payment_id=None, entry_type, amount, description="", metadata=None):
-    user_key = str(user_id or "").strip() or None
-    signed_amount = int(round(float(amount or 0)))
-    if payment_id is not None:
-        connection_check = None
-        cursor_check = None
-        try:
-            connection_check = get_db_connection()
-            cursor_check = connection_check.cursor(dictionary=True)
-            cursor_check.execute(
-                "SELECT id FROM customer_wallet_ledger WHERE payment_id = %s AND entry_type = %s LIMIT 1",
-                (int(payment_id), str(entry_type or "").strip()),
-            )
-            if cursor_check.fetchone():
-                return None
-        except Exception:
-            pass
-        finally:
-            if cursor_check is not None:
-                cursor_check.close()
-            if connection_check is not None and connection_check.is_connected():
-                connection_check.close()
-    balance_after = _get_wallet_balance(user_key) + signed_amount if user_key else signed_amount
-    connection = None
-    cursor = None
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor()
-        cursor.execute(
-            """
-            INSERT INTO customer_wallet_ledger
-                (user_id, booking_id, shipment_id, payment_id, entry_type, amount, balance_after, description, metadata_json, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            """,
-            (
-                user_key,
-                int(booking_id) if booking_id is not None else None,
-                int(shipment_id) if shipment_id is not None else None,
-                int(payment_id) if payment_id is not None else None,
-                str(entry_type or "").strip(),
-                signed_amount,
-                int(balance_after),
-                str(description or "").strip(),
-                json.dumps(metadata or {}, ensure_ascii=False),
-            ),
-        )
-        connection.commit()
-        ledger_id = cursor.lastrowid
-        _emit_socket_event("wallet:update", {"status": "success", "ledger_id": ledger_id, "user_id": user_key, "balance_after": balance_after, "amount": signed_amount})
-        return ledger_id
-    except Exception as error:
-        logger.warning(f"[wallet][ledger][warning] {error}")
-        return None
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if connection is not None and connection.is_connected():
-            connection.close()
-
-
-def _fetch_wallet_ledger(user_id=None, limit=100):
-    connection = None
-    cursor = None
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor(dictionary=True)
-        limit_value = max(1, min(int(limit or 100), 500))
-        if user_id:
-            cursor.execute(
-                "SELECT * FROM customer_wallet_ledger WHERE user_id = %s ORDER BY created_at DESC, id DESC LIMIT %s",
-                (str(user_id), limit_value),
-            )
-        else:
-            cursor.execute("SELECT * FROM customer_wallet_ledger ORDER BY created_at DESC, id DESC LIMIT %s", (limit_value,))
-        rows = cursor.fetchall() or []
-        for row in rows:
-            try:
-                row["metadata"] = json.loads(row.get("metadata_json") or "{}")
-            except Exception:
-                row["metadata"] = {}
-            row["created_at"] = row.get("created_at").isoformat(sep=" ", timespec="seconds") if row.get("created_at") else None
-        return rows
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if connection is not None and connection.is_connected():
-            connection.close()
-
-
-def _insert_payment_retry(payment_row, new_order_id, reason="", metadata=None):
-    connection = None
-    cursor = None
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor()
-        cursor.execute(
-            """
-            INSERT INTO payment_retries
-                (payment_id, booking_id, shipment_id, old_razorpay_order_id, new_razorpay_order_id, retry_reason, retry_count, status, metadata_json, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            """,
-            (
-                int(payment_row.get("id")) if payment_row and payment_row.get("id") is not None else None,
-                int(payment_row.get("booking_id")) if payment_row and payment_row.get("booking_id") is not None else None,
-                int(payment_row.get("shipment_id")) if payment_row and payment_row.get("shipment_id") is not None else None,
-                str((payment_row or {}).get("razorpay_order_id") or "").strip() or None,
-                str(new_order_id or "").strip() or None,
-                str(reason or "").strip(),
-                1,
-                "created",
-                json.dumps(metadata or {}, ensure_ascii=False),
-            ),
-        )
-        connection.commit()
-        return cursor.lastrowid
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if connection is not None and connection.is_connected():
-            connection.close()
-
-
-def _insert_payment_refund_record(payment_row, *, razorpay_payment_id, razorpay_refund_id=None, amount=0, status="initiated", reason="", metadata=None):
-    connection = None
-    cursor = None
-    try:
-        connection = get_db_connection()
-        cursor = connection.cursor()
-        cursor.execute(
-            """
-            INSERT INTO payment_refunds
-                (payment_id, booking_id, shipment_id, razorpay_payment_id, razorpay_refund_id, amount, status, reason, metadata_json, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            """,
-            (
-                int(payment_row.get("id")) if payment_row and payment_row.get("id") is not None else None,
-                int(payment_row.get("booking_id")) if payment_row and payment_row.get("booking_id") is not None else None,
-                int(payment_row.get("shipment_id")) if payment_row and payment_row.get("shipment_id") is not None else None,
-                str(razorpay_payment_id or "").strip(),
-                str(razorpay_refund_id or "").strip() or None,
-                int(round(float(amount or 0))),
-                str(status or "initiated").strip() or "initiated",
-                str(reason or "").strip(),
-                json.dumps(metadata or {}, ensure_ascii=False),
-            ),
-        )
-        connection.commit()
-        return cursor.lastrowid
-    finally:
-        if cursor is not None:
-            cursor.close()
-        if connection is not None and connection.is_connected():
-            connection.close()
-
-
 def _fetch_driver_records():
     connection = None
     cursor = None
@@ -6762,131 +5812,6 @@ def _build_admin_dashboard_payload(status_filter=None, payment_filter=None, days
         },
         "payment_records": [_serialize_payment_row(row) for row in payment_rows[:25]],
     }
-
-
-def _build_payment_analytics(days=30):
-    payment_rows = _fetch_payment_records()
-    cutoff_ts = time.time() - (max(1, int(days or 30)) * 86400)
-    recent_rows = []
-    for row in payment_rows:
-        created_at = row.get("created_at")
-        if hasattr(created_at, "timestamp") and created_at.timestamp() >= cutoff_ts:
-            recent_rows.append(row)
-
-    successful = [row for row in recent_rows if _payment_is_successful(row)]
-    failed = [row for row in recent_rows if str(row.get("payment_status") or row.get("status") or "").strip().lower() in {"failed", "error"}]
-    pending = [row for row in recent_rows if str(row.get("payment_status") or row.get("status") or "").strip().lower() in {"created", "pending"}]
-    refunded = [row for row in recent_rows if "refund" in str(row.get("payment_status") or row.get("status") or "").strip().lower()]
-
-    anomalies = []
-    for row in pending:
-        age_hours = 0.0
-        if hasattr(row.get("created_at"), "timestamp"):
-            age_hours = (time.time() - row["created_at"].timestamp()) / 3600
-        if age_hours >= 24:
-            anomalies.append({"type": "stale_payment", "severity": "warning", "payment": _serialize_payment_row(row), "message": f"Payment order {row.get('razorpay_order_id')} has been pending for {age_hours:.1f} hours."})
-    for row in failed[:10]:
-        anomalies.append({"type": "failed_payment", "severity": "critical", "payment": _serialize_payment_row(row), "message": f"Payment order {row.get('razorpay_order_id')} failed and may need retry."})
-
-    total_revenue = sum(int(row.get("amount") or 0) for row in successful)
-    return {
-        "summary": {
-            "total_payments": len(recent_rows),
-            "successful_payments": len(successful),
-            "pending_payments": len(pending),
-            "failed_payments": len(failed),
-            "refunded_payments": len(refunded),
-            "revenue_collected": total_revenue,
-            "success_rate": round((len(successful) / len(recent_rows)) * 100, 2) if recent_rows else 100.0,
-        },
-        "anomalies": anomalies[:25],
-        "recent_payments": [_serialize_payment_row(row) for row in recent_rows[:50]],
-        "wallet_ledger": _fetch_wallet_ledger(limit=50),
-    }
-
-
-def _build_driver_utilization_analytics():
-    drivers = [_serialize_driver_row(row) for row in _fetch_driver_records()]
-    total = len(drivers)
-    on_trip = len([driver for driver in drivers if str(driver.get("status") or "").lower() == "on_trip"])
-    available = len([driver for driver in drivers if str(driver.get("status") or "").lower() == "available"])
-    inactive = len([driver for driver in drivers if str(driver.get("status") or "").lower() in {"maintenance", "on_leave", "inactive"}])
-    return {
-        "summary": {
-            "total_drivers": total,
-            "on_trip": on_trip,
-            "available": available,
-            "inactive": inactive,
-            "utilization_rate": round((on_trip / total) * 100, 2) if total else 0.0,
-        },
-        "drivers": drivers,
-    }
-
-
-def _build_sla_monitoring_payload():
-    shipments = [_serialize_shipment_row(row) for row in _fetch_shipment_records(limit=200)]
-    delayed = [shipment for shipment in shipments if str(shipment.get("shipment_status") or "").lower() == "delayed"]
-    delivered = [shipment for shipment in shipments if str(shipment.get("shipment_status") or "").lower() in {"delivered", "completed"}]
-    active = [shipment for shipment in shipments if str(shipment.get("shipment_status") or "").lower() not in {"delivered", "completed", "cancelled", "failed"}]
-    return {
-        "summary": {
-            "active_shipments": len(active),
-            "delayed_shipments": len(delayed),
-            "delivered_shipments": len(delivered),
-            "sla_breach_rate": round((len(delayed) / max(len(active), 1)) * 100, 2) if active else 0.0,
-        },
-        "delayed_shipments": delayed[:25],
-        "active_shipments": active[:50],
-    }
-
-
-def _build_operational_alerts(control_payload):
-    alerts = []
-    payment_anomalies = (control_payload.get("payments") or {}).get("anomalies") or []
-    for anomaly in payment_anomalies[:5]:
-        alerts.append({"type": anomaly.get("type"), "severity": anomaly.get("severity") or "warning", "message": anomaly.get("message")})
-    sla_summary = ((control_payload.get("sla") or {}).get("summary") or {})
-    if int(sla_summary.get("delayed_shipments") or 0) > 0:
-        alerts.append({"type": "sla_delay", "severity": "warning", "message": f"{sla_summary.get('delayed_shipments')} shipments are delayed."})
-    monitoring_summary = ((control_payload.get("monitoring") or {}).get("summary") or {})
-    if int(monitoring_summary.get("error_count") or 0) > 0:
-        alerts.append({"type": "system_errors", "severity": "critical", "message": f"{monitoring_summary.get('error_count')} server errors captured in monitoring."})
-    return alerts[:20]
-
-
-def _build_admin_control_tower_payload(days=30):
-    dashboard = _build_admin_dashboard_payload(days=days)
-    monitoring = _build_monitoring_dashboard_payload(days=days)
-    payments = _build_payment_analytics(days=days)
-    driver_utilization = _build_driver_utilization_analytics()
-    sla = _build_sla_monitoring_payload()
-
-    try:
-        from db import get_workflow_retry_jobs, get_webhook_events, get_audit_logs, get_ai_tool_metrics
-        retry_jobs = get_workflow_retry_jobs(limit=100)
-        webhook_events = get_webhook_events(page=1, per_page=50, filters={})
-        audit_logs = get_audit_logs(page=1, per_page=50, filters={})
-        ai_observability = get_ai_tool_metrics(filters={})
-    except Exception as error:
-        logger.warning(f"[admin][control_tower][db_helpers][warning] {error}")
-        retry_jobs = []
-        webhook_events = {"items": []}
-        audit_logs = {"items": []}
-        ai_observability = {"summary": {}, "tools": []}
-
-    payload = {
-        "dashboard": dashboard,
-        "monitoring": monitoring,
-        "payments": payments,
-        "driver_utilization": driver_utilization,
-        "sla": sla,
-        "retry_queue": retry_jobs,
-        "webhook_monitoring": webhook_events,
-        "audit_logs": audit_logs,
-        "ai_observability": ai_observability,
-    }
-    payload["operational_alerts"] = _build_operational_alerts(payload)
-    return payload
 
 
 def _update_driver_record(driver_id, updates):
@@ -7433,7 +6358,7 @@ def _get_booking_paid_amount(booking_id):
     total = 0
 
     for payment_row in payments or []:
-        if not _payment_is_successful(payment_row):
+        if str(payment_row.get("payment_status") or payment_row.get("status") or "").strip().lower() != "paid":
             continue
 
         total += int(round(float(payment_row.get("amount") or 0)))
@@ -7446,21 +6371,15 @@ def _resolve_payment_amount(booking_row, payment_type, booking_id):
     paid_amount = _get_booking_paid_amount(booking_id)
     payment_kind = str(payment_type or "advance").strip().lower()
 
-    if payment_kind in {"full", "invoice", "balance", "final"}:
+    if payment_kind == "full":
         return max(total_price - paid_amount, 0)
-    if payment_kind == "partial":
-        return max(min(int(round(total_price * 0.25)), total_price - paid_amount), 0)
 
     advance_amount = _get_booking_advance_amount(booking_row)
     return max(advance_amount - paid_amount, 0)
 
 
 def _get_shipment_paid_amount(shipment_id):
-    total = 0
-    for payment_row in _fetch_payment_records_for_shipment(shipment_id) or []:
-        if _payment_is_successful(payment_row):
-            total += int(round(float(payment_row.get("amount") or 0)))
-    return total
+    return _get_booking_paid_amount(shipment_id)
 
 
 def _resolve_shipment_payment_amount(shipment_row, payment_type, shipment_id):
@@ -7468,35 +6387,11 @@ def _resolve_shipment_payment_amount(shipment_row, payment_type, shipment_id):
     paid_amount = _get_shipment_paid_amount(shipment_id)
     payment_kind = str(payment_type or "advance").strip().lower()
 
-    if payment_kind in {"full", "invoice", "balance", "final"}:
+    if payment_kind == "full":
         return max(total_price - paid_amount, 0)
-    if payment_kind == "partial":
-        return max(min(int(round(total_price * 0.25)), total_price - paid_amount), 0)
 
     advance_amount = int(round(total_price * RAZORPAY_ADVANCE_RATIO))
     return max(advance_amount - paid_amount, 0)
-
-
-def _build_payment_plan(total_amount, paid_amount=0):
-    total = int(round(float(total_amount or 0)))
-    paid = int(round(float(paid_amount or 0)))
-    outstanding = max(total - paid, 0)
-    advance = min(max(int(round(total * RAZORPAY_ADVANCE_RATIO)), 0), outstanding)
-    suggested_partial = min(max(int(round(total * 0.25)), 0), outstanding)
-    return {
-        "total_amount": total,
-        "paid_amount": paid,
-        "outstanding_amount": outstanding,
-        "advance_amount": advance,
-        "partial_amount": suggested_partial,
-        "invoice_amount": outstanding,
-        "currency": RAZORPAY_CURRENCY,
-        "milestones": [
-            {"type": "advance", "label": "Advance payment", "amount": advance, "status": "due" if advance else "settled"},
-            {"type": "partial", "label": "Partial payment", "amount": suggested_partial, "status": "optional" if suggested_partial else "settled"},
-            {"type": "invoice", "label": "Invoice balance", "amount": outstanding, "status": "due" if outstanding else "settled"},
-        ],
-    }
 
 
 def _build_invoice_payload(booking_row, payment_rows):
@@ -7686,7 +6581,7 @@ def _send_delivery_whatsapp_update(booking_row, status_text, details=None):
         return False
 
 
-def _create_razorpay_order(amount_rupees, booking_id, *, receipt_prefix="booking", notes=None, max_retries=2):
+def _create_razorpay_order(amount_rupees, booking_id):
     if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
         raise RuntimeError("Razorpay credentials are not configured")
 
@@ -7694,35 +6589,21 @@ def _create_razorpay_order(amount_rupees, booking_id, *, receipt_prefix="booking
     payload = {
         "amount": amount_paise,
         "currency": RAZORPAY_CURRENCY,
-        "receipt": f"{receipt_prefix}_{booking_id}_{int(time.time())}",
+        "receipt": f"booking_{booking_id}",
         "payment_capture": 1,
         "notes": {
             "booking_id": str(booking_id),
             "source": "SKDLS Transportations",
-            **(notes or {}),
         },
     }
 
-    response = None
-    last_error = None
-    for attempt in range(max(1, int(max_retries or 1)) + 1):
-        try:
-            response = requests.post(
-                f"{RAZORPAY_API_BASE_URL}/orders",
-                auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
-                json=payload,
-                timeout=20,
-            )
-            if response.ok or response.status_code not in {408, 429, 500, 502, 503, 504}:
-                break
-            last_error = RuntimeError(f"Razorpay order creation failed: {response.text[:300]}")
-        except requests.RequestException as error:
-            last_error = error
-        if attempt < int(max_retries or 0):
-            time.sleep(0.35 * (attempt + 1))
+    response = requests.post(
+        f"{RAZORPAY_API_BASE_URL}/orders",
+        auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+        json=payload,
+        timeout=20,
+    )
 
-    if response is None:
-        raise RuntimeError(f"Razorpay order creation failed: {last_error}")
     if not response.ok:
         raise RuntimeError(f"Razorpay order creation failed: {response.text[:300]}")
 
@@ -9406,44 +8287,17 @@ def _build_shipment_live_tracking_payload(shipment_row):
         return None
 
     live_location = None
-    driver_row = None
     lorry_number = str(shipment.get("lorry_number") or "").strip()
-    if shipment.get("assigned_driver_id"):
-        try:
-            connection = get_db_connection()
-            cursor = connection.cursor(dictionary=True)
-            try:
-                cursor.execute("SELECT * FROM drivers WHERE id = %s LIMIT 1", (int(shipment.get("assigned_driver_id")),))
-                driver_row = cursor.fetchone()
-            finally:
-                cursor.close()
-                connection.close()
-        except Exception:
-            driver_row = None
-    if not lorry_number and driver_row:
-        lorry_number = str(driver_row.get("assigned_truck") or "").strip()
-
     if lorry_number:
         try:
             live_location = get_lorry_tracking_data(lorry_number)
         except RuntimeError:
             live_location = None
-    latest_driver_location = _fetch_latest_driver_location(lorry_number=lorry_number, driver_id=shipment.get("assigned_driver_id"))
-    if (not live_location or live_location.get("message")) and latest_driver_location:
-        live_location = {
-            "lorry_number": lorry_number,
-            "latitude": latest_driver_location.get("latitude"),
-            "longitude": latest_driver_location.get("longitude"),
-            "last_updated": latest_driver_location.get("recorded_at") or latest_driver_location.get("created_at"),
-            "speed_kmph": latest_driver_location.get("speed_kmph"),
-            "heading_degrees": latest_driver_location.get("heading_degrees"),
-        }
 
     pickup_location = str(shipment.get("pickup_location") or "").strip()
     drop_location = str(shipment.get("drop_location") or "").strip()
     truck_type_code = _normalize_truck_type(shipment.get("truck_type"), shipment.get("weight"))
     route_coordinates = []
-    geofence_coordinates = []
     distance_km = None
     eta_hours = None
     route_source = "planned"
@@ -9483,7 +8337,6 @@ def _build_shipment_live_tracking_payload(shipment_row):
         )
         distance_km = float(route_info.get("distance_km") or 0)
         route_coordinates = route_info.get("coordinates") or []
-        geofence_coordinates = route_coordinates
         eta_hours = _estimate_eta_hours(distance_km, truck_type_code or "12")
         route_source = route_info.get("source") or "planned"
 
@@ -9493,45 +8346,15 @@ def _build_shipment_live_tracking_payload(shipment_row):
         except Exception:
             eta_hours = None
 
-    speed_kmph = _coerce_float_or_none((live_location or {}).get("speed_kmph") or (latest_driver_location or {}).get("speed_kmph"))
-    heading_degrees = _coerce_float_or_none((live_location or {}).get("heading_degrees") or (latest_driver_location or {}).get("heading_degrees"))
-    traffic = _traffic_state(speed_kmph=speed_kmph)
-    if eta_hours is not None:
-        eta_hours = round(float(eta_hours) * float(traffic.get("eta_multiplier") or 1.0), 2)
-    heartbeat_timestamp = (
-        (latest_driver_location or {}).get("recorded_at")
-        or (latest_driver_location or {}).get("created_at")
-        or (live_location or {}).get("last_updated")
-    )
-    heartbeat = _tracking_heartbeat_state(heartbeat_timestamp, speed_kmph=speed_kmph)
-    route_progress = _calculate_route_progress(live_location["latitude"], live_location["longitude"], geofence_coordinates or route_coordinates) if live_location and live_location.get("latitude") is not None and live_location.get("longitude") is not None else {"percent": 0, "nearest_index": 0, "remaining_points": 0}
-    geofences = _build_geofence_state(live_location["latitude"], live_location["longitude"], geofence_coordinates or route_coordinates) if live_location and live_location.get("latitude") is not None and live_location.get("longitude") is not None else []
-
-    payload = {
+    return {
         "shipment": shipment,
-        "shipment_id": shipment.get("id"),
-        "driver_id": shipment.get("assigned_driver_id"),
-        "driver": {
-            "id": shipment.get("assigned_driver_id"),
-            "name": str((driver_row or {}).get("driver_name") or "").strip(),
-            "phone": str((driver_row or {}).get("phone") or "").strip(),
-            "status": str((driver_row or {}).get("status") or "").strip(),
-        } if driver_row else None,
-        "lorry_number": lorry_number,
         "live_location": live_location,
         "latest_location": live_location,
         "route_coordinates": route_coordinates,
-        "optimized_route": route_coordinates,
         "route_source": route_source,
         "distance_km": round(float(distance_km), 1) if distance_km is not None else shipment.get("distance_km"),
         "eta_hours": eta_hours,
         "gps_available": bool(live_location and live_location.get("latitude") is not None and live_location.get("longitude") is not None),
-        "heartbeat": heartbeat,
-        "traffic": traffic,
-        "geofences": geofences,
-        "route_progress": route_progress,
-        "speed_kmph": speed_kmph,
-        "heading_degrees": heading_degrees,
         "timeline": _fetch_shipment_timeline(shipment.get("id")),
         "summary": {
             "status": shipment.get("shipment_status") or "pending",
@@ -9541,8 +8364,6 @@ def _build_shipment_live_tracking_payload(shipment_row):
             "last_updated": live_location.get("last_updated") if live_location else shipment.get("created_at"),
         },
     }
-    payload["alerts"] = _tracking_alerts_for_state({**payload, "booking_status": shipment.get("shipment_status")})
-    return payload
 
 
 def _advance_request_flow(user_state):
@@ -10076,48 +8897,8 @@ def gps_ingest():
             return jsonify({"status": "error", "message": "Invalid latitude/longitude"}), 400
 
         booking_id = payload.get("booking_id")
-        shipment_id = payload.get("shipment_id")
-        driver_id = payload.get("driver_id")
-        booking_id = booking_id if str(booking_id or "").strip() else None
-        shipment_id = shipment_id if str(shipment_id or "").strip() else None
-        driver_id = driver_id if str(driver_id or "").strip() else None
-        speed_kmph = _coerce_float_or_none(payload.get("speed_kmph") or payload.get("speed") or payload.get("speedKmph"))
-        heading_degrees = _coerce_float_or_none(payload.get("heading_degrees") or payload.get("heading") or payload.get("bearing"))
-        accuracy_meters = _coerce_float_or_none(payload.get("accuracy_meters") or payload.get("accuracy"))
-        battery_level = _coerce_float_or_none(payload.get("battery_level") or payload.get("battery"))
-        event_type = str(payload.get("event_type") or payload.get("event") or "gps_ping").strip() or "gps_ping"
-        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
         source_loc = str(payload.get("source_location") or payload.get("source") or "").strip()
         dest_loc = str(payload.get("destination_location") or payload.get("destination") or "").strip()
-        driver_row = None
-
-        if driver_id is None:
-            driver_row = _fetch_driver_by_lorry_number(lorry_number)
-            if driver_row and driver_row.get("id") is not None:
-                driver_id = int(driver_row.get("id"))
-        if driver_row is None and driver_id is not None:
-            try:
-                conn_driver = get_db_connection()
-                cur_driver = conn_driver.cursor(dictionary=True)
-                try:
-                    cur_driver.execute("SELECT * FROM drivers WHERE id = %s LIMIT 1", (int(driver_id),))
-                    driver_row = cur_driver.fetchone()
-                finally:
-                    cur_driver.close()
-                    conn_driver.close()
-            except Exception:
-                driver_row = None
-
-        shipment_row = None
-        if shipment_id is not None:
-            try:
-                shipment_row = _fetch_shipment_record_by_id(shipment_id)
-            except Exception:
-                shipment_row = None
-        if shipment_row is None:
-            shipment_row = _fetch_active_shipment_for_lorry(lorry_number, driver_id=driver_id)
-            if shipment_row and shipment_row.get("id") is not None:
-                shipment_id = int(shipment_row.get("id"))
 
         # Persist GPS point
         conn = get_db_connection()
@@ -10125,49 +8906,22 @@ def gps_ingest():
         try:
             cur.execute(
                 """
-                INSERT INTO gps_logs
-                    (booking_id, shipment_id, driver_id, lorry_number, latitude, longitude, speed_kmph, heading_degrees, source_location, destination_location, event_type, metadata_json, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                INSERT INTO gps_logs (booking_id, lorry_number, latitude, longitude, source_location, destination_location, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
                 """,
                 (
                     int(booking_id) if booking_id is not None else None,
-                    int(shipment_id) if shipment_id is not None else None,
-                    int(driver_id) if driver_id is not None else None,
                     lorry_number,
                     latitude,
                     longitude,
-                    speed_kmph,
-                    heading_degrees,
                     source_loc or None,
                     dest_loc or None,
-                    event_type,
-                    json.dumps(metadata, ensure_ascii=False),
                 ),
             )
             conn.commit()
         finally:
             cur.close()
             conn.close()
-
-        heartbeat_status = "online"
-        try:
-            _persist_driver_location(
-                driver_id=driver_id,
-                shipment_id=shipment_id,
-                booking_id=booking_id,
-                lorry_number=lorry_number,
-                latitude=latitude,
-                longitude=longitude,
-                speed_kmph=speed_kmph,
-                heading_degrees=heading_degrees,
-                accuracy_meters=accuracy_meters,
-                battery_level=battery_level,
-                heartbeat_status=heartbeat_status,
-                source=str(payload.get("source_type") or payload.get("provider") or "gps").strip() or "gps",
-                metadata={**metadata, "event_type": event_type},
-            )
-        except Exception as error:
-            logger.warning(f"[gps][driver_location][warning] {error}")
 
         # Update vehicles table (best-effort) so fleet queries reflect latest position
         try:
@@ -10186,61 +8940,13 @@ def gps_ingest():
             # Non-fatal if vehicles table doesn't contain this lorry
             pass
 
-        tracked_bookings = _find_booking_rows_by_lorry_number(lorry_number)
-        enriched_truck = None
-        if tracked_bookings:
-            enriched_truck = _build_fleet_tracking_payload(tracked_bookings[0])
-        if not enriched_truck:
-            heartbeat = _tracking_heartbeat_state(_current_timestamp(), speed_kmph=speed_kmph)
-            traffic = _traffic_state(speed_kmph=speed_kmph, slowdown=payload.get("traffic_slowdown"))
-            enriched_truck = {
-                "booking_id": int(booking_id) if booking_id is not None else None,
-                "shipment_id": int(shipment_id) if shipment_id is not None else None,
-                "driver_id": int(driver_id) if driver_id is not None else None,
-                "driver": {
-                    "id": int(driver_id) if driver_id is not None else None,
-                    "name": str((driver_row or {}).get("driver_name") or "").strip(),
-                    "phone": str((driver_row or {}).get("phone") or "").strip(),
-                    "status": str((driver_row or {}).get("status") or "").strip(),
-                } if driver_row else None,
-                "lorry_number": lorry_number,
-                "latitude": latitude,
-                "longitude": longitude,
-                "speed_kmph": speed_kmph,
-                "heading_degrees": heading_degrees,
-                "last_updated": _current_timestamp().isoformat(sep=" ", timespec="seconds"),
-                "gps_available": True,
-                "heartbeat": heartbeat,
-                "traffic": traffic,
-                "alerts": _tracking_alerts_for_state({"lorry_number": lorry_number, "heartbeat": heartbeat, "traffic": traffic, "geofences": []}),
-            }
-
-        if shipment_row is not None:
-            try:
-                next_status = _progress_shipment_from_tracking(shipment_row, enriched_truck)
-                enriched_truck["shipment_status"] = next_status or enriched_truck.get("shipment_status") or shipment_row.get("shipment_status")
-                _persist_tracking_alerts(enriched_truck, shipment_row=shipment_row, driver_row=driver_row)
-            except Exception as error:
-                logger.warning(f"[gps][status_progression][warning] {error}")
-
+        # Emit a lightweight per-truck update and broadcast full fleet update
         try:
-            socketio.emit("truck:location", enriched_truck)
-            socketio.emit(
-                "driver:heartbeat",
-                {
-                    "lorry_number": lorry_number,
-                    "driver_id": enriched_truck.get("driver_id"),
-                    "heartbeat": enriched_truck.get("heartbeat"),
-                    "latitude": latitude,
-                    "longitude": longitude,
-                    "speed_kmph": speed_kmph,
-                    "timestamp": enriched_truck.get("last_updated"),
-                },
-            )
-            socketio.emit("eta:update", {"status": "success", "truck": enriched_truck, "shipment_id": enriched_truck.get("shipment_id")})
+            socketio.emit("truck:location", {"lorry_number": lorry_number, "latitude": latitude, "longitude": longitude})
         except Exception:
             logger.exception("[socketio][truck:location] emit failed")
 
+        tracked_bookings = _find_booking_rows_by_lorry_number(lorry_number)
         for booking_row in tracked_bookings:
             try:
                 _broadcast_tracking_snapshot(booking_row=booking_row, source="gps.ingest", event_name="tracking:update", status_note="Live GPS movement")
@@ -10258,19 +8964,13 @@ def gps_ingest():
             except Exception as error:
                 logger.warning(f"[socketio][gps:tracking][warning] {error}")
 
-        if shipment_row is not None:
-            try:
-                _broadcast_tracking_snapshot(shipment_row=_fetch_shipment_record_by_id(shipment_row.get("id")) or shipment_row, source="gps.ingest", event_name="tracking:update", status_note="Live GPS movement")
-            except Exception as error:
-                logger.warning(f"[socketio][gps:shipment_tracking][warning] {error}")
-
         # Trigger full fleet update (reads DB and computes routes/ETAs)
         try:
             _broadcast_live_fleet_update()
         except Exception:
             logger.exception("[gps][ingest] failed to broadcast fleet update")
 
-        return jsonify({"status": "success", "message": "GPS point ingested", "truck": enriched_truck})
+        return jsonify({"status": "success", "message": "GPS point ingested"})
     except Exception as error:
         logger.exception(f"[gps][ingest][error] {error}")
         return jsonify({"status": "error", "message": str(error)}), 500
@@ -10310,21 +9010,11 @@ def gps_playback(booking_id):
         logs = []
         for row in rows:
             try:
-                log_payload = _tracking_log_payload(row)
-                if logs:
-                    previous = logs[-1]
-                    log_payload["segment_km"] = round(
-                        _calculate_straight_line_distance_km(
-                            previous["latitude"],
-                            previous["longitude"],
-                            log_payload["latitude"],
-                            log_payload["longitude"],
-                        ),
-                        3,
-                    )
-                else:
-                    log_payload["segment_km"] = 0
-                logs.append(log_payload)
+                logs.append({
+                    "latitude": float(row.get("latitude")),
+                    "longitude": float(row.get("longitude")),
+                    "created_at": row.get("created_at").isoformat(sep=" ", timespec="seconds") if row.get("created_at") else None,
+                })
             except Exception:
                 continue
 
@@ -10381,208 +9071,13 @@ def gps_eta(booking_id):
         # Estimate ETA using truck type from booking if available
         truck_type = booking_row.get("tyre_type") or booking_row.get("truck_type") or "12"
         eta_hours = _estimate_eta_hours(distance_km, truck_type)
-        traffic = _traffic_state(speed_kmph=row.get("speed_kmph"))
-        eta_hours = round(float(eta_hours) * float(traffic.get("eta_multiplier") or 1.0), 2) if eta_hours is not None else None
 
-        return jsonify({"status": "success", "distance_km": distance_km, "eta_hours": eta_hours, "traffic": traffic, "route": route})
+        return jsonify({"status": "success", "distance_km": distance_km, "eta_hours": eta_hours, "route": route})
     except Exception as error:
         logger.exception(f"[gps][eta][error] {error}")
         return jsonify({"status": "error", "message": str(error)}), 500
-
-
-@app.route("/gps/shipments/live", methods=["GET"])
-@require_auth
-def gps_shipments_live():
-    try:
-        shipment_rows = [
-            row for row in _fetch_shipment_records(limit=200)
-            if str(row.get("shipment_status") or "pending").lower() not in {"delivered", "completed", "cancelled", "failed"}
-        ]
-        shipments = []
-        for row in shipment_rows:
-            payload = _build_shipment_live_tracking_payload(row)
-            if payload:
-                shipments.append(payload)
-        return jsonify({"status": "success", "count": len(shipments), "shipments": shipments})
     except Exception as error:
-        logger.exception(f"[gps][shipments_live][error] {error}")
-        return jsonify({"status": "error", "message": str(error)}), 500
-
-
-@app.route("/gps/fleet/heatmap", methods=["GET"])
-@require_auth
-def gps_fleet_heatmap():
-    try:
-        limit = max(1, min(int(request.args.get("limit", 500)), 2000))
-        connection = get_db_connection()
-        cursor = connection.cursor(dictionary=True)
-        try:
-            cursor.execute(
-                """
-                SELECT lorry_number, latitude, longitude, speed_kmph, recorded_at AS created_at
-                FROM driver_locations
-                ORDER BY recorded_at DESC, id DESC
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            rows = cursor.fetchall() or []
-        finally:
-            cursor.close()
-            connection.close()
-
-        points = []
-        for row in rows:
-            try:
-                points.append({
-                    "lorry_number": str(row.get("lorry_number") or "").strip(),
-                    "latitude": float(row.get("latitude")),
-                    "longitude": float(row.get("longitude")),
-                    "speed_kmph": _coerce_float_or_none(row.get("speed_kmph")),
-                    "weight": 1 if _coerce_float_or_none(row.get("speed_kmph")) is None else max(0.2, min(1.0, 1 - (float(row.get("speed_kmph") or 0) / 90))),
-                    "created_at": _serialize_tracking_timestamp(row.get("created_at")),
-                })
-            except Exception:
-                continue
-        return jsonify({"status": "success", "count": len(points), "points": points})
-    except Exception as error:
-        logger.exception(f"[gps][heatmap][error] {error}")
-        return jsonify({"status": "error", "message": str(error)}), 500
-
-
-@app.route("/gps/geofences", methods=["GET"])
-@require_auth
-def gps_geofences():
-    try:
-        zones = []
-        for row in _get_booking_fleet_rows():
-            truck = _build_fleet_tracking_payload(row)
-            for zone in (truck or {}).get("geofences") or []:
-                zones.append({**zone, "lorry_number": (truck or {}).get("lorry_number"), "booking_id": (truck or {}).get("booking_id"), "shipment_id": (truck or {}).get("shipment_id")})
-        return jsonify({"status": "success", "count": len(zones), "geofences": zones})
-    except Exception as error:
-        logger.exception(f"[gps][geofences][error] {error}")
-        return jsonify({"status": "error", "message": str(error)}), 500
-
-
-@app.route("/gps/inactivity", methods=["GET"])
-@require_auth
-def gps_inactivity():
-    try:
-        inactive = []
-        for row in _get_booking_fleet_rows():
-            truck = _build_fleet_tracking_payload(row)
-            heartbeat = (truck or {}).get("heartbeat") or {}
-            if heartbeat.get("inactive") or heartbeat.get("status") in {"stale", "offline", "unknown"}:
-                inactive.append(truck)
-        return jsonify({"status": "success", "count": len(inactive), "trucks": inactive})
-    except Exception as error:
-        logger.exception(f"[gps][inactivity][error] {error}")
-        return jsonify({"status": "error", "message": str(error)}), 500
-
-
-@app.route("/gps/route-optimization", methods=["POST"])
-@require_auth
-def gps_route_optimization():
-    try:
-        payload = request.get_json(silent=True) or {}
-        stops = payload.get("stops") if isinstance(payload.get("stops"), list) else []
-        parsed_stops = []
-        for index, stop in enumerate(stops):
-            label = str((stop or {}).get("label") or (stop or {}).get("location") or f"Stop {index + 1}").strip()
-            latitude = _coerce_float_or_none((stop or {}).get("latitude") or (stop or {}).get("lat"))
-            longitude = _coerce_float_or_none((stop or {}).get("longitude") or (stop or {}).get("lng"))
-            if (latitude is None or longitude is None) and (stop or {}).get("location"):
-                try:
-                    latitude, longitude = _get_coordinates(str(stop.get("location")))
-                except Exception:
-                    latitude, longitude = None, None
-            if latitude is None or longitude is None:
-                continue
-            parsed_stops.append({"label": label, "latitude": float(latitude), "longitude": float(longitude), "original_index": index})
-
-        if not parsed_stops:
-            return jsonify({"status": "error", "message": "At least one geocodable stop is required"}), 400
-
-        current = payload.get("current_location") if isinstance(payload.get("current_location"), dict) else {}
-        current_lat = _coerce_float_or_none(current.get("latitude") or current.get("lat"))
-        current_lng = _coerce_float_or_none(current.get("longitude") or current.get("lng"))
-        if current_lat is None or current_lng is None:
-            current_lat, current_lng = parsed_stops[0]["latitude"], parsed_stops[0]["longitude"]
-
-        remaining = parsed_stops[:]
-        ordered = []
-        cursor_lat = float(current_lat)
-        cursor_lng = float(current_lng)
-        total_km = 0.0
-        while remaining:
-            next_stop = min(
-                remaining,
-                key=lambda stop: _calculate_straight_line_distance_km(cursor_lat, cursor_lng, stop["latitude"], stop["longitude"]),
-            )
-            leg_km = _calculate_straight_line_distance_km(cursor_lat, cursor_lng, next_stop["latitude"], next_stop["longitude"])
-            total_km += float(leg_km)
-            ordered.append({**next_stop, "leg_km": round(float(leg_km), 2)})
-            cursor_lat, cursor_lng = next_stop["latitude"], next_stop["longitude"]
-            remaining.remove(next_stop)
-
-        return jsonify({"status": "success", "optimized_stops": ordered, "distance_km": round(total_km, 2)})
-    except Exception as error:
-        logger.exception(f"[gps][route_optimization][error] {error}")
-        return jsonify({"status": "error", "message": str(error)}), 500
-
-
-@app.route("/gps/driver-heartbeat", methods=["POST"])
-def gps_driver_heartbeat():
-    try:
-        payload = request.get_json(silent=True) or {}
-        api_key_header = request.headers.get("X-API-KEY") or request.args.get("api_key") or payload.get("api_key")
-        jwt_ok = False
-        try:
-            auth_header = request.headers.get("Authorization") or ""
-            if auth_header.startswith("Bearer "):
-                verify_jwt_in_request()
-                jwt_ok = True
-        except Exception:
-            return jsonify({"status": "error", "message": "Invalid authentication token"}), 401
-        if not jwt_ok and not _validate_api_key(api_key_header):
-            return jsonify({"status": "error", "message": "Missing or invalid API key"}), 401
-
-        lorry_number = str(payload.get("lorry_number") or payload.get("vehicle_number") or "").strip()
-        driver_id = payload.get("driver_id")
-        driver_id = driver_id if str(driver_id or "").strip() else None
-        driver_row = None
-        if not driver_id and lorry_number:
-            driver_row = _fetch_driver_by_lorry_number(lorry_number)
-            driver_id = driver_row.get("id") if driver_row else None
-        latest = _fetch_latest_driver_location(lorry_number=lorry_number, driver_id=driver_id)
-        latitude = _coerce_float_or_none(payload.get("latitude") or (latest or {}).get("latitude"))
-        longitude = _coerce_float_or_none(payload.get("longitude") or (latest or {}).get("longitude"))
-        speed_kmph = _coerce_float_or_none(payload.get("speed_kmph") or payload.get("speed") or (latest or {}).get("speed_kmph"))
-
-        if latitude is not None and longitude is not None and lorry_number:
-            _persist_driver_location(
-                driver_id=driver_id,
-                shipment_id=payload.get("shipment_id") or (latest or {}).get("shipment_id"),
-                booking_id=payload.get("booking_id") or (latest or {}).get("booking_id"),
-                lorry_number=lorry_number,
-                latitude=latitude,
-                longitude=longitude,
-                speed_kmph=speed_kmph,
-                heading_degrees=payload.get("heading_degrees") or (latest or {}).get("heading_degrees"),
-                accuracy_meters=payload.get("accuracy_meters"),
-                battery_level=payload.get("battery_level"),
-                heartbeat_status="online",
-                source="heartbeat",
-                metadata={"heartbeat": True},
-            )
-            latest = _fetch_latest_driver_location(lorry_number=lorry_number, driver_id=driver_id)
-
-        heartbeat = _tracking_heartbeat_state((latest or {}).get("recorded_at") or (latest or {}).get("created_at") or _current_timestamp(), speed_kmph=speed_kmph)
-        socketio.emit("driver:heartbeat", {"lorry_number": lorry_number, "driver_id": int(driver_id) if driver_id is not None else None, "heartbeat": heartbeat, "latitude": latitude, "longitude": longitude})
-        return jsonify({"status": "success", "lorry_number": lorry_number, "driver_id": int(driver_id) if driver_id is not None else None, "heartbeat": heartbeat})
-    except Exception as error:
-        logger.exception(f"[gps][driver_heartbeat][error] {error}")
+        logger.exception(f"[gps][ingest][error] {error}")
         return jsonify({"status": "error", "message": str(error)}), 500
 
 
@@ -10609,16 +9104,14 @@ def auth_register():
             return jsonify({"status": "error", "message": "Unable to create user"}), 500
 
         access_token = _build_access_token_for_user(user_row)
-        refresh_token = _build_refresh_token_for_user(user_row)
         response = jsonify(
             {
                 "status": "success",
                 "message": "Account created successfully",
                 **_auth_response_payload(user_row),
-                "csrf_token": get_csrf_token(access_token),
             }
         )
-        _attach_auth_cookies(response, access_token, refresh_token)
+        set_access_cookies(response, access_token)
         return response, 201
     except ValueError as error:
         return jsonify({"status": "error", "message": str(error)}), 400
@@ -10656,13 +9149,9 @@ def driver_login():
         if not _verify_password(stored_hash, password):
             return jsonify({"status": "error", "message": "Invalid credentials"}), 401
 
-        driver_claims = {"role": "driver", "phone": driver.get("phone")}
-        access_token = create_access_token(identity=str(driver.get("id")), additional_claims=driver_claims)
-        refresh_token = create_refresh_token(identity=str(driver.get("id")), additional_claims={**driver_claims, "token_use": "refresh"})
+        access_token = create_access_token(identity=str(driver.get("id")), additional_claims={"role": "driver", "phone": driver.get("phone")})
 
-        response = jsonify({"status": "success", "access_token": access_token, "refresh_token": refresh_token, "csrf_token": get_csrf_token(access_token), "driver": {"id": int(driver.get("id")), "driver_name": driver.get("driver_name"), "phone": driver.get("phone")}})
-        _attach_auth_cookies(response, access_token, refresh_token)
-        return response
+        return jsonify({"status": "success", "access_token": access_token, "driver": {"id": int(driver.get("id")), "driver_name": driver.get("driver_name"), "phone": driver.get("phone")}})
     except Exception as error:
         logger.exception(f"[auth][driver][login][error] {error}")
         return jsonify({"status": "error", "message": str(error)}), 500
@@ -10681,16 +9170,14 @@ def auth_login():
             return jsonify({"status": "error", "message": "Invalid email or password"}), 401
 
         access_token = _build_access_token_for_user(user_row)
-        refresh_token = _build_refresh_token_for_user(user_row)
         response = jsonify(
             {
                 "status": "success",
                 "message": "Login successful",
                 **_auth_response_payload(user_row),
-                "csrf_token": get_csrf_token(access_token),
             }
         )
-        _attach_auth_cookies(response, access_token, refresh_token)
+        set_access_cookies(response, access_token)
         return response
     except ValueError as error:
         return jsonify({"status": "error", "message": str(error)}), 400
@@ -10722,34 +9209,6 @@ def auth_logout():
     response = jsonify({"status": "success", "message": "Logged out successfully"})
     unset_jwt_cookies(response)
     return response
-
-
-@app.route("/api/auth/refresh", methods=["POST"])
-@app.route("/auth/refresh", methods=["POST"])
-@jwt_required(refresh=True)
-def auth_refresh():
-    try:
-        identity = get_jwt_identity()
-        claims = get_jwt() or {}
-        role = str(claims.get("role") or "customer").strip().lower() or "customer"
-        if role == "driver":
-            access_token = create_access_token(identity=str(identity), additional_claims={"role": "driver", "phone": claims.get("phone")})
-            response = jsonify({"status": "success", "message": "Token refreshed", "csrf_token": get_csrf_token(access_token)})
-            set_access_cookies(response, access_token)
-            response.headers["X-CSRF-TOKEN"] = get_csrf_token(access_token)
-            return response
-
-        user_row = _get_user_by_id(identity)
-        if not user_row:
-            return jsonify({"status": "error", "message": "User not found"}), 404
-        access_token = _build_access_token_for_user(user_row)
-        response = jsonify({"status": "success", "message": "Token refreshed", **_auth_response_payload(user_row), "csrf_token": get_csrf_token(access_token)})
-        set_access_cookies(response, access_token)
-        response.headers["X-CSRF-TOKEN"] = get_csrf_token(access_token)
-        return response
-    except RuntimeError as error:
-        logger.exception(f"[auth][refresh][error] {error}")
-        return jsonify({"status": "error", "message": str(error)}), 500
 
 
 @limiter.limit("20 per minute")
@@ -10860,23 +9319,6 @@ def admin_monitoring_dashboard():
         return jsonify({"status": "success", **payload})
     except RuntimeError as error:
         logger.exception(f"[admin][monitoring][error] {error}")
-        return jsonify({"status": "error", "message": str(error)}), 500
-
-
-@app.route("/api/admin/control-tower", methods=["GET"])
-@app.route("/admin/control-tower", methods=["GET"])
-@require_auth
-@require_role("admin")
-def admin_control_tower():
-    try:
-        try:
-            days = max(1, min(int(request.args.get("days", 30)), 90))
-        except (TypeError, ValueError):
-            days = 30
-        payload = _build_admin_control_tower_payload(days=days)
-        return jsonify({"status": "success", **payload})
-    except RuntimeError as error:
-        logger.exception(f"[admin][control_tower][error] {error}")
         return jsonify({"status": "error", "message": str(error)}), 500
 
 
@@ -11446,18 +9888,6 @@ def razorpay_webhook():
             if order_id:
                 try:
                     _update_payment_record(order_id, razorpay_payment_id=payment_id, payment_status="captured")
-                    rec = _fetch_payment_record_by_order_id(order_id)
-                    if rec:
-                        _insert_wallet_ledger_entry(
-                            user_id=_payment_target_user_id(rec),
-                            booking_id=rec.get("booking_id"),
-                            shipment_id=rec.get("shipment_id"),
-                            payment_id=rec.get("id"),
-                            entry_type="payment_credit",
-                            amount=int(round(float(rec.get("amount") or amount / 100 or 0))),
-                            description="Razorpay payment captured",
-                            metadata={"source": "razorpay.webhook", "razorpay_payment_id": payment_id, "razorpay_order_id": order_id},
-                        )
                 except Exception:
                     current_app.logger.exception("failed updating payment record for captured event")
             else:
@@ -11530,13 +9960,10 @@ def payment_refund():
         return jsonify({"status": "error", "message": "razorpay_payment_id is required"}), 400
 
     try:
-        payment_row = _fetch_payment_record_by_payment_id(razorpay_payment_id)
-        payment_amount_rupees = int(round(float((payment_row or {}).get("amount") or 0)))
         url = f"{RAZORPAY_API_BASE_URL}/payments/{razorpay_payment_id}/refund"
         body = {}
         if amount:
-            amount_value = int(round(float(amount)))
-            body["amount"] = amount_value if amount_value > max(payment_amount_rupees * 2, 1000) else amount_value * 100
+            body["amount"] = int(amount)
         if reason:
             body["notes"] = {"reason": str(reason)}
 
@@ -11546,32 +9973,17 @@ def payment_refund():
             return jsonify({"status": "error", "message": "refund failed", "detail": resp.text}), 500
 
         refund_obj = resp.json()
-        refund_amount_rupees = int(round(float(refund_obj.get("amount") or body.get("amount") or (payment_amount_rupees * 100)) / 100))
 
         # try to update local payment record
         try:
-            rec = payment_row or _fetch_payment_record_by_payment_id(razorpay_payment_id)
+            conn = get_db_connection()
+            cur = conn.cursor(dictionary=True)
+            cur.execute(f"SELECT * FROM {PAYMENTS_TABLE} WHERE razorpay_payment_id = %s LIMIT 1", (str(razorpay_payment_id),))
+            rec = cur.fetchone()
+            cur.close()
+            conn.close()
             if rec:
                 _update_payment_record(rec.get("razorpay_order_id"), razorpay_payment_id=razorpay_payment_id, payment_status="refund_initiated")
-                _insert_payment_refund_record(
-                    rec,
-                    razorpay_payment_id=razorpay_payment_id,
-                    razorpay_refund_id=refund_obj.get("id"),
-                    amount=refund_amount_rupees,
-                    status=str(refund_obj.get("status") or "initiated"),
-                    reason=reason or "",
-                    metadata={"source": "payments.refund", "razorpay_refund": refund_obj},
-                )
-                _insert_wallet_ledger_entry(
-                    user_id=_payment_target_user_id(rec),
-                    booking_id=rec.get("booking_id"),
-                    shipment_id=rec.get("shipment_id"),
-                    payment_id=rec.get("id"),
-                    entry_type="refund_debit",
-                    amount=-refund_amount_rupees,
-                    description="Refund initiated",
-                    metadata={"razorpay_payment_id": razorpay_payment_id, "razorpay_refund_id": refund_obj.get("id"), "reason": reason},
-                )
         except Exception:
             current_app.logger.exception("failed updating payment record after refund api call")
 
@@ -12121,13 +10533,10 @@ def create_payment_order():
         shipment_id = payload.get("shipment_id") or payload.get("shipmentId")
         session_id = payload.get("session_id") or payload.get("sessionId")
         payment_type = str(payload.get("payment_type") or payload.get("paymentType") or "advance").strip().lower()
-        requested_amount = payload.get("amount") or payload.get("amount_due") or payload.get("amountDue")
 
         target_type = None
         target_row = None
         target_id = None
-        paid_amount = 0
-        total_amount = 0
 
         if booking_id:
             target_type = "booking"
@@ -12136,8 +10545,6 @@ def create_payment_order():
             if not target_row:
                 return jsonify({"status": "error", "message": "Booking not found"}), 404
             amount_due = _resolve_payment_amount(target_row, payment_type, target_id)
-            paid_amount = _get_booking_paid_amount(target_id)
-            total_amount = int(round(float(target_row.get("price") or 0)))
         elif shipment_id:
             target_type = "shipment"
             target_id = int(shipment_id)
@@ -12145,30 +10552,13 @@ def create_payment_order():
             if not target_row:
                 return jsonify({"status": "error", "message": "Shipment not found"}), 404
             amount_due = _resolve_shipment_payment_amount(target_row, payment_type, target_id)
-            paid_amount = _get_shipment_paid_amount(target_id)
-            total_amount = int(round(float(target_row.get("estimated_price") or 0)))
         else:
             raise ValueError("booking_id or shipment_id is required")
-
-        if requested_amount not in (None, ""):
-            requested_amount_value = int(round(float(requested_amount)))
-            if requested_amount_value <= 0:
-                raise ValueError("Payment amount must be greater than zero")
-            amount_due = min(requested_amount_value, amount_due)
 
         if amount_due <= 0:
             raise ValueError("No amount is due for this payment type")
 
-        order_data = _create_razorpay_order(
-            amount_due,
-            target_id,
-            receipt_prefix=target_type,
-            notes={
-                "entity_type": target_type,
-                "payment_type": payment_type,
-                "session_id": str(session_id or ""),
-            },
-        )
+        order_data = _create_razorpay_order(amount_due, target_id)
         _insert_payment_record(
             int(booking_id) if booking_id else None,
             order_data["id"],
@@ -12190,7 +10580,6 @@ def create_payment_order():
                 "shipment_status": str(target_row.get("shipment_status") or "pending") if target_type == "shipment" else None,
                 "payment_type": payment_type,
                 "advance_amount": _get_booking_advance_amount(target_row) if target_type == "booking" else int(round(float(target_row.get("estimated_price") or 0) * RAZORPAY_ADVANCE_RATIO)),
-                "payment_plan": _build_payment_plan(total_amount, paid_amount),
                 "amount_due": amount_due,
                 "amount": int(order_data.get("amount", amount_due * 100)),
                 "currency": order_data.get("currency", RAZORPAY_CURRENCY),
@@ -12265,23 +10654,6 @@ def verify_payment():
                 payment_type=payment_type,
                 shipment_id=int(shipment_id) if shipment_id else None,
                 session_id=session_id,
-            )
-
-        payment_db_row = _fetch_payment_record_by_order_id(razorpay_order_id)
-        if payment_db_row:
-            _insert_wallet_ledger_entry(
-                user_id=_payment_target_user_id(payment_db_row),
-                booking_id=payment_db_row.get("booking_id"),
-                shipment_id=payment_db_row.get("shipment_id"),
-                payment_id=payment_db_row.get("id"),
-                entry_type="payment_credit",
-                amount=int(round(float(payment_amount))),
-                description=f"{payment_type.title()} payment captured",
-                metadata={
-                    "razorpay_order_id": razorpay_order_id,
-                    "razorpay_payment_id": razorpay_payment_id,
-                    "source": "payments.verify",
-                },
             )
 
         shipment_reference = int(shipment_id) if shipment_id else None
@@ -12443,89 +10815,6 @@ def payment_history():
         )
     except RuntimeError as error:
         logger.exception(f"[payments][history][error] {error}")
-        return jsonify({"status": "error", "message": str(error)}), 500
-
-
-@limiter.limit("10 per minute")
-@app.route("/payments/retry", methods=["POST"])
-@require_auth
-def payment_retry():
-    try:
-        payload = request.get_json(silent=True) or {}
-        payment_id = payload.get("payment_id") or payload.get("paymentId")
-        razorpay_order_id = payload.get("razorpay_order_id") or payload.get("order_id") or payload.get("orderId")
-        reason = str(payload.get("reason") or "customer_retry").strip()
-
-        payment_row = _fetch_payment_record_by_id(payment_id) if payment_id else _fetch_payment_record_by_order_id(razorpay_order_id)
-        if not payment_row:
-            return jsonify({"status": "error", "message": "Payment record not found"}), 404
-        if _payment_is_successful(payment_row):
-            return jsonify({"status": "error", "message": "Successful payments cannot be retried"}), 400
-
-        amount_due = int(round(float(payment_row.get("amount") or 0)))
-        target_type = "shipment" if payment_row.get("shipment_id") is not None else "booking"
-        target_id = int(payment_row.get("shipment_id") or payment_row.get("booking_id"))
-        order_data = _create_razorpay_order(
-            amount_due,
-            target_id,
-            receipt_prefix=f"{target_type}_retry",
-            notes={"retry_of": str(payment_row.get("razorpay_order_id") or ""), "payment_type": payment_row.get("payment_type") or "retry"},
-        )
-        new_payment_id = _insert_payment_record(
-            int(payment_row.get("booking_id")) if payment_row.get("booking_id") is not None else None,
-            order_data["id"],
-            amount_due,
-            "created",
-            payment_type=payment_row.get("payment_type") or "retry",
-            shipment_id=int(payment_row.get("shipment_id")) if payment_row.get("shipment_id") is not None else None,
-        )
-        retry_id = _insert_payment_retry(payment_row, order_data["id"], reason=reason, metadata={"new_payment_id": new_payment_id})
-        _emit_socket_event("payment:update", {"status": "success", "action": "retry_created", "retry_id": retry_id, "order_id": order_data["id"]})
-        return jsonify({"status": "success", "retry_id": retry_id, "payment_id": new_payment_id, "order_id": order_data["id"], "amount": int(order_data.get("amount", amount_due * 100)), "currency": order_data.get("currency", RAZORPAY_CURRENCY), "key_id": RAZORPAY_KEY_ID})
-    except ValueError as error:
-        return jsonify({"status": "error", "message": str(error)}), 400
-    except RuntimeError as error:
-        logger.exception(f"[payments][retry][error] {error}")
-        return jsonify({"status": "error", "message": str(error)}), 500
-
-
-@app.route("/payments/wallet", methods=["GET"])
-@require_auth
-def payment_wallet():
-    try:
-        user_id = request.args.get("user_id") or get_jwt_identity()
-        limit = max(1, min(int(request.args.get("limit", 100)), 500))
-        ledger = _fetch_wallet_ledger(user_id=user_id, limit=limit)
-        return jsonify({"status": "success", "user_id": str(user_id or ""), "balance": _get_wallet_balance(user_id), "ledger": ledger})
-    except RuntimeError as error:
-        logger.exception(f"[payments][wallet][error] {error}")
-        return jsonify({"status": "error", "message": str(error)}), 500
-
-
-@app.route("/api/admin/payments/analytics", methods=["GET"])
-@app.route("/admin/payments/analytics", methods=["GET"])
-@require_auth
-@require_role("admin")
-def admin_payment_analytics():
-    try:
-        days = max(1, min(int(request.args.get("days", 30)), 90))
-        return jsonify({"status": "success", **_build_payment_analytics(days=days)})
-    except RuntimeError as error:
-        logger.exception(f"[admin][payments][analytics][error] {error}")
-        return jsonify({"status": "error", "message": str(error)}), 500
-
-
-@app.route("/api/admin/payments/anomalies", methods=["GET"])
-@app.route("/admin/payments/anomalies", methods=["GET"])
-@require_auth
-@require_role("admin")
-def admin_payment_anomalies():
-    try:
-        days = max(1, min(int(request.args.get("days", 30)), 90))
-        analytics = _build_payment_analytics(days=days)
-        return jsonify({"status": "success", "count": len(analytics.get("anomalies") or []), "anomalies": analytics.get("anomalies") or []})
-    except RuntimeError as error:
-        logger.exception(f"[admin][payments][anomalies][error] {error}")
         return jsonify({"status": "error", "message": str(error)}), 500
 
 
@@ -13641,9 +11930,7 @@ if __name__ == "__main__":
         logger.info(f"[database][startup] mysql_version={version}")
         test_cursor.close()
         test_conn.close()
-        logger.info(
-            f"[startup][database] DB connected host={DB_CONFIG.get('host')} database={DB_CONFIG.get('database')}"
-        )
+        logger.info("[startup][database] DB connection verified")
     except Exception as error:
         logger.exception(f"[startup][error] Database connection verification failed: {error}")
         raise SystemExit(1)
@@ -13651,24 +11938,17 @@ if __name__ == "__main__":
     if not test_db_connection():
         logger.warning("[startup][warning] Database appears unreachable. App will continue, but DB operations may fail.")
 
-    _log_ai_startup_state()
-
     if ENABLE_GPS_SIMULATOR and gps_simulator is not None:
         logger.info("[gps] Starting GPS simulator")
         gps_simulator.start()
     else:
         logger.info("[gps] GPS simulator disabled; using live GPS ingest only")
     validate_database_schema()
-    host = os.getenv("HOST", "127.0.0.1").strip() or "127.0.0.1"
-    port = _get_int_env("PORT", 5000)
-    logger.info(
-        f"[startup][socketio] Socket.IO initialized async_mode={SOCKETIO_ASYNC_MODE} cors_origins={ALLOWED_CORS_ORIGINS}"
-    )
     logger.info("[startup] Flask application starting")
     socketio.run(
         app,
-        host=host,
-        port=port,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
         debug=False,
         allow_unsafe_werkzeug=True,
     )
